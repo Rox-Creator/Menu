@@ -220,6 +220,19 @@ local function GetKeyName(vk)
     return VK_NAMES[vk] or string.format("0x%02X", vk)
 end
 
+-- All in-menu notifications route through the INS-ui library's own toast
+-- (GUI._lib:Notify) so they match the menu's look. Falls back to Matcha's
+-- global notify() only when the lib isn't up (load-failure path / post-unload,
+-- when the lib is destroyed). kind = "success"/"warning"/"info"/"error".
+local function uiNotify(title, msg, dur, kind)
+    local lib = GUI._lib
+    if lib then
+        local ok = pcall(function() lib:Notify(title, msg, dur, kind) end)
+        if ok then return end
+    end
+    pcall(notify, title, msg, dur)
+end
+
 -- ============================================================
 -- ORE ESP CONFIG
 -- ============================================================
@@ -4585,7 +4598,7 @@ UnloadScript = function()
         pcall(function() data.nameTag:Remove() end)
     end
     ACTOR_ESP.Objects = {}
-    notify("Menu", "Unloaded!", 3)
+    uiNotify("Menu", "Unloaded!", 3)
 end
 
 -- ============================================================
@@ -6099,7 +6112,7 @@ end)()  -- /Requiem UI smooth engine
         end
     end
     if type(Lib) ~= "table" then
-        pcall(function() notify("Requiem", "UI library failed to load (no internet?)", 6) end)
+        pcall(function() uiNotify("Requiem", "UI library failed to load (no internet?)", 6) end)
         warn("[Requiem] INS-ui failed to load")
         return
     end
@@ -6142,7 +6155,7 @@ end)()  -- /Requiem UI smooth engine
 
     -- Requiem's own logo. The forked lib ships a baked-in default (Verfall's) and the
     -- CreateWindow `logo` option doesn't reliably override it — so force it via SetLogo too.
-    local REQUIEM_LOGO = "https://tr.rbxcdn.com/180DAY-feffde8d73bda422f53dd31fc43d4ae3/256/256/Image/Webp/noFilter"
+    local REQUIEM_LOGO = "https://tr.rbxcdn.com/180DAY-feffde8d73bda422f53dd31fc43d4ae3/150/150/Image/Webp/noFilter"
     local window = Lib:CreateWindow({
         title     = "Requiem",
         subtitle  = "AOTR",
@@ -6194,7 +6207,7 @@ end)()  -- /Requiem UI smooth engine
                     registered = registered + 1
                     if data.liveModel then alive = alive + 1 end
                 end
-                notify("Actors", registered .. " registered, " .. alive .. " alive", 4)
+                uiNotify("Actors", registered .. " registered, " .. alive .. " alive", 4)
             end
         end)
     end)
@@ -6305,7 +6318,7 @@ end)()  -- /Requiem UI smooth engine
         local savedDefault = {}   -- your value BEFORE the first change (for Reset Default)
 
         local cache = {}   -- key -> filtered getgc entries (so Apply/Reset never re-scan the whole GC)
-        local function notif(t, m, d) pcall(notify, t, m, d or 3) end
+        local function notif(t, m, d) uiNotify(t, m, d or 3) end
         local function keep(cfg, e)   -- is this getgc entry the real numeric config value (not a hash decoy)?
             if type(e) ~= "table" or e.type ~= "number" then return false end
             local v = tonumber(e.value); return v ~= nil and v >= cfg.lo and v <= cfg.hi
@@ -6436,7 +6449,7 @@ end)()  -- /Requiem UI smooth engine
         end)
         sec:Button("Fetch Current Ragdolls", function()
             local sentNow = deathFetchAllNow()
-            notify("Death Log", "Fetched " .. tostring(sentNow) .. " ragdoll(s) to webhook", 3)
+            uiNotify("Death Log", "Fetched " .. tostring(sentNow) .. " ragdoll(s) to webhook", 3)
         end)
         pcall(function()
             sec:Label(function()
@@ -6466,7 +6479,7 @@ end)()  -- /Requiem UI smooth engine
         pcall(function() secAbout:Label(function() return "Player List:   " .. GetKeyName(GUI.PlayerListKey) end) end)
     end)
 
-    notify("Requiem", "Loaded  -  F3 menu  -  " .. GetKeyName(GUI.CloseKey) .. " unload", 4)
+    uiNotify("Requiem", "Loaded  -  F3 menu  -  " .. GetKeyName(GUI.CloseKey) .. " unload", 4)
     print("[Requiem] loaded with INS-ui front-end")
 end)()
 
@@ -6482,6 +6495,6 @@ spawn(DmgIndicatorLoop)
 pcall(function() getgenv().GUI = GUI end)
 
 print("Requiem loaded! " .. GetKeyName(GUI.ToggleKey) .. " = toggle. " .. GetKeyName(GUI.CloseKey) .. " = unload.")
-notify("Requiem", "Loaded! " .. GetKeyName(GUI.ToggleKey) .. " to toggle", 3)
+uiNotify("Requiem", "Loaded! " .. GetKeyName(GUI.ToggleKey) .. " to toggle", 3)
 
 return GUI
