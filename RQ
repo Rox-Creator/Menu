@@ -6444,6 +6444,59 @@ end)()  -- /Requiem UI smooth engine
             resetMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate", "GearVelocityDecayRate" })
         end)
 
+        -- SMART ADDITIVE auto-apply (experimental). The plain overwrite flattened server buffs;
+        -- this reads your LIVE value each cycle via memory_read at the GC entry's address — an
+        -- INSTANT read, NO getgc scan/freeze (verified 2026-07-03: the getgc entry's .addr IS the
+        -- value's address; memory_read("double", addr) returns it exactly) — then re-applies your
+        -- BOOST (slider - base) ON TOP of whatever's there, so buffs STACK and you're never lowered.
+        --   base   = your original value (savedDefault, captured on first touch)
+        --   delta  = slider - base   (e.g. 1.7 - 1.04 = +0.66, "your boost")
+        --   target = current_live_value + delta
+        -- Change-detection (live vs my last write) stops it compounding (1.7->2.3->2.9...): only when
+        -- the game moved the value since my last write do we treat it as a new natural to add onto.
+        -- A generation token stops duplicate loops; falls back to a plain overwrite if Unsafe LuaU
+        -- (memory_read) is off.
+        local veAutoGen = 0
+        local function veSlider(key)
+            if key == "GearMaxVelocityMultiplier" then return veMax end
+            if key == "GearVelocityIncreaseRate" then return veInc end
+            return veDec
+        end
+        secVe:Toggle("Auto-Apply (Exp)", false, function(v)
+            if not v then veAutoGen = veAutoGen + 1; return end   -- off -> invalidate the running loop
+            veAutoGen = veAutoGen + 1
+            local myGen = veAutoGen
+            local natural, lastWrite = {}, {}   -- per-key: game's current natural value / my last write
+            task.spawn(function()
+                local canRead = type(memory_read) == "function"
+                while veAutoGen == myGen and GUI.Running do
+                    for _, key in ipairs({ "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate", "GearVelocityDecayRate" }) do
+                        local safe = entriesFor(key)           -- cached filtered entries (fast; no re-scan)
+                        local base = savedDefault[key]
+                        if #safe > 0 and base then
+                            local cur
+                            if canRead and safe[1].addr then    -- instant live read at the value's address
+                                local ok, r = pcall(memory_read, "double", safe[1].addr)
+                                if ok then cur = tonumber(r) end
+                            end
+                            if cur then
+                                -- the game moved it since my last write (a buff applied/expired) -> new natural
+                                if lastWrite[key] == nil or math.abs(cur - lastWrite[key]) > 0.001 then
+                                    natural[key] = cur
+                                end
+                                local target = (natural[key] or cur) + (veSlider(key) - base)
+                                apply(key, target)
+                                lastWrite[key] = target
+                            else
+                                apply(key, veSlider(key))       -- no fast read (Unsafe off) -> plain overwrite
+                            end
+                        end
+                    end
+                    task.wait(3)
+                end
+            end)
+        end):Tooltip("experimental - reads your LIVE velocity each cycle (instant memory read, no freeze) and STACKS your boost on top of server buffs; never lowers you")
+
         secVe:Label(function() return "Live projection  ->  Tools  ->  Velocity Indicator" end)
     end)
 
