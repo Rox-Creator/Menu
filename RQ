@@ -6319,6 +6319,7 @@ end)()  -- /Requiem UI smooth engine
         local CFG = {
             ERADICATE_CHAIN_MAX_KILLS   = { lo = 2, hi = 50,    fb = 3    },
             ERADICATE_CHAIN_LOCKOUT_SEC = { lo = 1, hi = 200,   fb = 120  },
+            ERADICATE_CHAIN_WINDOW_SEC  = { lo = 2, hi = 60,    fb = 10   },
             GearGrappleRangeMultiplier  = { lo = 0, hi = 1000,  fb = 1    },
             GearAdditionalGrappleRange  = { lo = 0, hi = 20000, fb = 0    },
             GearMaxVelocityMultiplier   = { lo = 0, hi = 100,   fb = 1.11 },
@@ -6401,15 +6402,17 @@ end)()  -- /Requiem UI smooth engine
         task.spawn(function() pcall(warm) end)        -- warm the cache once, in the background
 
         -- ---------- Eradicate (Sentinel chain capstone) ----------
-        local secEr = tab:Section("Eradicate", "Left", "Chain kills / lockout")
+        local secEr = tab:Section("Eradicate", "Left", "Chain kills / lockout / window")
         local erKills, erLock = CFG.ERADICATE_CHAIN_MAX_KILLS.fb, CFG.ERADICATE_CHAIN_LOCKOUT_SEC.fb
+        local erWindow = CFG.ERADICATE_CHAIN_WINDOW_SEC.fb
         secEr:Slider("Chain Max Kills", erKills, 1, 3, 50, "", function(v) erKills = math.floor(tonumber(v) or erKills) end)
         secEr:Slider("Chain Lockout", erLock, 1, 1, 120, "s", function(v) erLock = math.floor(tonumber(v) or erLock) end)
+        secEr:Slider("Chain Window", erWindow, 1, 10, 50, "s", function(v) erWindow = math.floor(tonumber(v) or erWindow) end)
         secEr:Button("Apply Eradicate", function()
-            applyMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC" }, { erKills, erLock })
+            applyMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC", "ERADICATE_CHAIN_WINDOW_SEC" }, { erKills, erLock, erWindow })
         end)
         secEr:Button("Reset Default", function()
-            resetMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC" })
+            resetMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC", "ERADICATE_CHAIN_WINDOW_SEC" })
         end)
 
         -- ---------- Grapple (ODM hook range) ----------
