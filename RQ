@@ -6303,6 +6303,126 @@ end)()  -- /Requiem UI smooth engine
         end)
         secInd:Toggle("Damage Indicator", GUI.DmgIndicatorEnabled, function(v) GUI.DmgIndicatorEnabled = v end)
         secInd:Toggle("Velocity Indicator", GUI.VeloOpen, function(v) GUI.VeloOpen = v end)
+
+        -- ---------- Skillcheck auto-play (QTE minigame) ----------
+        -- Legit auto-tapper: reads the spinner + target-zone angle straight from memory
+        -- (GuiObject.Rotation is a float at struct offset +376; not exposed by the property
+        -- bridge) and taps SPACE (a real OS key the game's InputBegan sees, NOT a remote) the
+        -- instant the spinner is predicted inside the +/-20 deg zone. Velocity is measured from
+        -- ACTUAL rotation changes (immune to loop/render aliasing) and it only taps once the
+        -- spinner has genuinely moved (kills idle-spam that instant-fails a fresh check).
+        -- Cost: idle-polls at 10Hz doing nothing; per-frame work (2 native memory reads) only
+        -- while a check is on screen, so it never lags the menu.
+        local secAuto = tab:Section("Skillcheck", "Left", "Auto-tap the QTE (SPACE)")
+        local scGen = 0
+        secAuto:Toggle("Auto Skillcheck", false, function(on)
+            scGen = scGen + 1
+            if not on then return end
+            local myGen = scGen
+            task.spawn(function()
+                local ROT_OFFSET, PRESS_WINDOW, DIFF_GATE = 376, 9, 30
+                local LATENCY, MAXVEL, GLITCH_JUMP        = 5/1000, 900, 90
+                local STATIC_TIMEOUT, COOLDOWN, HOLD      = 1/5, 3/20, 3/100
+                local RESOLVE_TTL, IDLE_WAIT              = 1/2, 1/10
+                local VK_SPACE = 0x20
+                local plrs  = game:GetService("Players")
+                local mread = memory_read
+                local clk   = os.clock
+                local abs   = math.abs
+
+                local function nav(root, ...)
+                    for _, nm in ipairs({ ... }) do
+                        if not root then return nil end
+                        root = root:FindFirstChild(nm)
+                    end
+                    return root
+                end
+                local function addrOf(inst)
+                    if not inst then return nil end
+                    local ok, a = pcall(function() return inst.Address end)
+                    if ok and a then return tonumber(a) end
+                    return nil
+                end
+                local function readRot(addr)
+                    if not addr then return nil end
+                    local ok, v = pcall(mread, "float", addr + ROT_OFFSET)
+                    if ok and type(v) == "number" and v == v then return v % 360 end
+                    return nil
+                end
+                local function angdiff(a, b) return ((a - b + 540) % 360) - 180 end
+                local function rbxActive()
+                    local ok, r = pcall(isrbxactive)
+                    if ok then return r end
+                    return true
+                end
+
+                local pg, cache
+                local lastS, lastChangeT, velEst, lastPress = nil, nil, 0, nil
+
+                while scGen == myGen and GUI.Running do
+                    if not pg then
+                        local lp = plrs.LocalPlayer
+                        pg = lp and lp:FindFirstChild("PlayerGui")
+                    end
+                    local sc = pg and pg:FindFirstChild("Skillcheck")
+
+                    if not sc then
+                        cache, lastS, lastChangeT, velEst = nil, nil, nil, 0
+                        task.wait(IDLE_WAIT)
+                    else
+                        local now = clk()
+                        if (not cache) or (now - cache.t) > RESOLVE_TTL then
+                            local spin = nav(sc, "Skillcheck", "Group", "Frame", "Frame", "Content", "Spinner")
+                            local val  = nav(sc, "Skillcheck", "Group", "Frame", "Frame", "Content", "Validation")
+                            local sa, va = addrOf(spin), addrOf(val)
+                            if sa and va then cache = { spin = sa, val = va, t = now } else cache = nil end
+                        end
+
+                        if cache then
+                            local s = readRot(cache.spin)
+                            local t = readRot(cache.val)
+                            if s and t then
+                                if lastS == nil then
+                                    lastS = s
+                                else
+                                    local d = angdiff(s, lastS)
+                                    if abs(d) > GLITCH_JUMP then
+                                        lastS = s
+                                    elseif d ~= 0 then
+                                        if lastChangeT then
+                                            local ddt = now - lastChangeT
+                                            if ddt > 0 then
+                                                local vv = d / ddt
+                                                if vv > MAXVEL then vv = MAXVEL elseif vv < -MAXVEL then vv = -MAXVEL end
+                                                velEst = vv
+                                            end
+                                        end
+                                        lastChangeT = now
+                                        lastS = s
+                                    end
+                                end
+
+                                local moving = (lastChangeT ~= nil) and ((now - lastChangeT) < STATIC_TIMEOUT)
+                                local diff   = angdiff(s, t)
+                                local pred   = ((diff + velEst * LATENCY + 540) % 360) - 180
+
+                                if moving and abs(diff) <= DIFF_GATE and abs(pred) <= PRESS_WINDOW
+                                    and rbxActive()
+                                    and ((not lastPress) or (now - lastPress) > COOLDOWN) then
+                                    lastPress = now
+                                    pcall(keypress, VK_SPACE)
+                                    task.wait(HOLD)
+                                    pcall(keyrelease, VK_SPACE)
+                                    lastS = nil
+                                end
+                            end
+                        end
+
+                        task.wait()
+                    end
+                end
+            end)
+        end):Tooltip("Legit auto-tap: reads the spinner + zone angle from memory and presses SPACE on time. Roblox must be the focused window. Not an instant-win.")
     end)
 
     -- ===== Tab: Character  (ability config pins: Eradicate / Grapple / Velocity) =====
