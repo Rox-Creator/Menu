@@ -6321,7 +6321,7 @@ end)()  -- /Requiem UI smooth engine
             local myGen = scGen
             task.spawn(function()
                 local ROT_OFFSET, PRESS_WINDOW, DIFF_GATE = 376, 9, 30
-                local LATENCY, MAXVEL, GLITCH_JUMP        = 5/1000, 900, 90
+                local LATENCY, MAXVEL, GLITCH_JUMP        = 0.5/1000, 900, 90
                 local STATIC_TIMEOUT, COOLDOWN, HOLD      = 1/5, 3/20, 3/100
                 local RESOLVE_TTL, IDLE_WAIT              = 1/2, 1/10
                 local VK_SPACE = 0x20
