@@ -6160,6 +6160,62 @@ end)()  -- /Requiem UI smooth engine
     -- collision). Then re-assert for ~12s so the lib's async config-autoload can't restore a
     -- stale (Verfall) logo over ours. Must be the /Png/ thumbnail (WebP bytes would be rejected).
     local REQUIEM_LOGO = "https://tr.rbxcdn.com/180DAY-feffde8d73bda422f53dd31fc43d4ae3/150/150/Image/Png/noFilter"
+
+    -- ===== Wonder desktop-app bridge hook (Script view) =====
+    do
+        local g = getgenv()
+        g.__wonder = g.__wonder or { features = {}, order = {} }
+        g.__wonder_apply = function(name, value)
+            local f = g.__wonder.features[name]
+            if f and f.set then local ok = pcall(f.set, value); if ok then f.value = value end end
+        end
+        g.__wonder_unload = function() pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end) end
+        if type(Lib) == "table" and type(Lib.CreateWindow) == "function" and not rawget(Lib, "__wonderWrapped") then
+            rawset(Lib, "__wonderWrapped", true)
+            local origCreate = Lib.CreateWindow
+            Lib.CreateWindow = function(self, ...)
+                local win = origCreate(self, ...)
+                if type(win) == "table" and type(win.Tab) == "function" then
+                    local origTab = win.Tab
+                    win.Tab = function(w, ...)
+                        local tab = origTab(w, ...)
+                        if type(tab) == "table" and type(tab.Section) == "function" then
+                            local origSection = tab.Section
+                            tab.Section = function(t, ...)
+                                local sec = origSection(t, ...)
+                                if type(sec) == "table" and type(sec.Toggle) == "function" then
+                                    local origToggle = sec.Toggle
+                                    sec.Toggle = function(s, label, default, cb, ...)
+                                        local obj, guard
+                                        local function wcb(v)
+                                            if guard then return end
+                                            if wonder_toggle then pcall(wonder_toggle, label, v) end
+                                            if cb then return cb(v) end
+                                        end
+                                        obj = origToggle(s, label, default, wcb, ...)
+                                        if g.__wonder.features[label] == nil then g.__wonder.order[#g.__wonder.order + 1] = label end
+                                        g.__wonder.features[label] = { type = "toggle", value = default and true or false, set = function(val)
+                                            val = val and true or false
+                                            guard = true
+                                            if type(obj) == "table" and type(obj.Set) == "function" then pcall(function() obj:Set(val) end) end
+                                            guard = false
+                                            if cb then pcall(cb, val) end
+                                        end }
+                                        return obj
+                                    end
+                                end
+                                return sec
+                            end
+                        end
+                        return tab
+                    end
+                end
+                return win
+            end
+        end
+    end
+    -- ========================================================
+
     local window = Lib:CreateWindow({
         title     = "Requiem",
         subtitle  = "Bro you don't go 290 velo",
@@ -6170,6 +6226,14 @@ end)()  -- /Requiem UI smooth engine
     })
     GUI._lib = Lib
     GUI._window = window
+    -- Wonder "Control in game": start the on-screen menu HIDDEN (features still run) so the user
+    -- drives toggles from the Wonder app without the in-game menu's render lag. Best-effort hide.
+    if getgenv().__wonder_headless then
+        pcall(function() window:SetVisible(false) end)
+        pcall(function() window.Visible = false end)
+        pcall(function() window:Hide() end)
+        pcall(function() Lib:SetVisible(false) end)
+    end
     task.spawn(function()
         local ok, png = pcall(function() return game:HttpGet(REQUIEM_LOGO) end)
         if not (ok and type(png) == "string" and #png > 24
