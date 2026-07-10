@@ -6670,7 +6670,7 @@ end)()  -- /Requiem UI smooth engine
         secFire:Label(function() return "Inaccuracy 0 | Recoil 0" end)
         local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
         local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the first zero
-        secFire:Button("Zero Spread / Recoil", function()
+        secFire:Button("Apply Firearms", function()
             task.spawn(function()
                 local okAll = true
                 for _, key in ipairs(FIRE_KEYS) do
