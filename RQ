@@ -6454,6 +6454,11 @@ end)()  -- /Requiem UI smooth engine
             GAS_COST                            = { lo = 0, hi = 200,    fb = 150 },
             BURST_FORCE                         = { lo = 1, hi = 100000, fb = 280 },
             NON_SUCCESSFUL_PARRY_WINDOW_SECONDS = { lo = 0, hi = 60,     fb = 5   },
+            -- Firearm no-spread / no-recoil (Musket + Flintlock; getgc hits ALL guns by name).
+            -- Real numerics: inaccuracy 2.5/7.5/8.5, recoil 2/4 -> range [1,20] spans them; every
+            -- other same-name GC entry is a string decoy (excluded by type). Restore is per-entry.
+            BASE_INACCURACY_OFFSET              = { lo = 1, hi = 20,     fb = 0   },
+            BASE_RECOIL_IMPULSE                 = { lo = 1, hi = 20,     fb = 0   },
         }
         local savedDefault = {}   -- your value BEFORE the first change (for Reset Default)
 
@@ -6652,6 +6657,48 @@ end)()  -- /Requiem UI smooth engine
         end)
         secParry:Button("Restore Default", function()
             resetMany("Parry", { "NON_SUCCESSFUL_PARRY_WINDOW_SECONDS" })
+        end)
+
+        -- ---------- Firearms (Muskets + Flintlocks): zero spread + recoil ----------
+        -- Sets BASE_INACCURACY_OFFSET (7.5) + BASE_RECOIL_IMPULSE (2) -> 0. Both are client-read
+        -- (spread in getProjectilePhysics, recoil in the AddVelocity kick), so 0 = dead-center,
+        -- no kick. getgc matches the key across EVERY firearm config (defaults differ: inaccuracy
+        -- 2.5/7.5/8.5, recoil 2/4) so "Zero" writes 0 to all guns; "Restore" writes each gun's OWN
+        -- captured original back PER-ENTRY (applygc on a 1-entry list = that one address only), so
+        -- the 2.5/8.5/4 guns are never flattened to a single value.
+        local secFire = tab:Section("Firearms", "Right", "Muskets + Flintlocks: no spread / no recoil")
+        secFire:Label(function() return "Inaccuracy 0 | Recoil 0" end)
+        local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
+        local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the first zero
+        secFire:Button("Zero Spread / Recoil", function()
+            task.spawn(function()
+                local okAll = true
+                for _, key in ipairs(FIRE_KEYS) do
+                    local safe = entriesFor(key)
+                    if #safe == 0 then okAll = false end
+                    fireOrig[key] = fireOrig[key] or {}
+                    for _, e in ipairs(safe) do
+                        local a = tostring(e.addr)
+                        if fireOrig[key][a] == nil then fireOrig[key][a] = tonumber(e.value) end
+                    end
+                    if not apply(key, 0) then okAll = false end
+                end
+                notif("Firearms", okAll and "Muskets + Flintlocks: 0 spread / 0 recoil" or "Failed - equip a firearm first", 3)
+            end)
+        end)
+        secFire:Button("Restore Default", function()
+            task.spawn(function()
+                for _, key in ipairs(FIRE_KEYS) do
+                    local orig = fireOrig[key]
+                    if orig then
+                        for _, e in ipairs(entriesFor(key)) do
+                            local o = orig[tostring(e.addr)]
+                            if o ~= nil then pcall(function() applygc({ e }, key, o) end) end
+                        end
+                    end
+                end
+                notif("Firearms", "Restored original spread + recoil", 3)
+            end)
         end)
     end)
 
