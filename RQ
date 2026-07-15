@@ -4503,6 +4503,7 @@ end
 
 UnloadScript = function()
     GUI.Running = false
+    _G.RQBlockInput = nil   -- never leave the shared-fork input gate stuck on after we're gone
     -- Tear down the INS-ui front-end first (its own input/render owns the menu).
     pcall(function() if GUI._lib then GUI._lib:Destroy() end end)
     GUI._window = nil
@@ -5987,6 +5988,41 @@ local function drawVelo()
     R.fade=1; R.yoff=0
 end
 
+-- Character-tab lock overlay: dims ONLY the Character panel (rect from _G.RQGeo, published by the
+-- patched INS-ui fork) + a centered "Load Values" popup with ONE button. Shows only while the menu
+-- is open, the Character tab is active, and Values aren't loaded. Drawn last so its button click wins.
+local function drawCharLock()
+    local geo = _G.RQGeo
+    -- Locked = menu open, on the Character tab, Values not yet loaded.
+    local locked = type(geo) == "table" and geo.open == true and geo.tab == "Character"
+        and not (GUI.CharIsLoaded and GUI.CharIsLoaded())
+    -- Freeze the lib's OWN control input while locked — the patched fork's cN()
+    -- callback dispatcher checks this flag and swallows every control callback,
+    -- so sliders/buttons/toggles behind the scrim do nothing. Cleared the moment
+    -- you load, switch tabs, or close the menu. nil (not false) so a stale flag
+    -- can never bleed into another script that shares the fork.
+    _G.RQBlockInput = locked or nil
+    if not locked then return end
+    local gx, gy, gw, gh = geo.cx, geo.cy, geo.cw, geo.ch
+    if type(gx) ~= "number" or type(gy) ~= "number" or type(gw) ~= "number" or type(gh) ~= "number" then return end
+    if gw < 40 or gh < 40 then return end
+    R.fade = 1; R.yoff = 0; R.clipTop = nil; R.clipBot = nil
+    local Z = 3000000   -- lib content uses ZIndex up to 2,049,999 (!) — must clear it to sit on top
+    rect(gx, gy, gw, gh, C3(8, 8, 11), Z, 0.66, 6)                       -- scrim over ONLY the panel
+    local pw = minf(380, gw - 36); local ph = 156
+    local px = gx + (gw - pw) / 2; local py = gy + (gh - ph) / 2
+    shadow(px, py, pw, ph, Z + 1)
+    rect(px, py, pw, ph, T.panel, Z + 2, 0.98, 9)
+    rect(px, py, pw, ph, T.red, Z + 3, 0.75, 9, false, 1)
+    rect(px, py, pw, 3, T.red, Z + 4, 0.9, 2)
+    txt("VALUES LOCKED", px + pw / 2, py + 22, 16, T.red, Z + 4, true, Drawing.Fonts.SystemBold)
+    txt("Load Values to use the Character tab.", px + pw / 2, py + 52, 12, T.text, Z + 4, true)
+    txt("Scans memory once (~15s). Cached until you rejoin.", px + pw / 2, py + 72, 11, T.muted, Z + 4, true)
+    button("charlockload", px + (pw - 210) / 2, py + ph - 48, 210, 34, "Load Values  (~15s)", function()
+        if GUI.CharLoad then GUI.CharLoad() end
+    end, true, T.red, Z + 5)
+end
+
 -- old Build*Panel are no longer renderers — the loop draws from GUI.*Open flags.
 BuildPlayerList = function() end
 BuildEnchantsPanel = function() end
@@ -6029,7 +6065,7 @@ task.spawn(function()
         R._wasManip = manip
 
         beginFrame(); clicks={}; drags={}; scrolls={}; resizes={}
-        local ok,err=pcall(function() drawPlayers(); drawEnchants(); drawRS(); drawVelo() end)
+        local ok,err=pcall(function() drawPlayers(); drawEnchants(); drawRS(); drawVelo(); drawCharLock() end)
         endFrame()
         if not ok then warn("[Requiem UI] "..tostring(err)) end
 
@@ -6460,9 +6496,32 @@ end)()  -- /Requiem UI smooth engine
             BASE_INACCURACY_OFFSET              = { lo = 1, hi = 20,     fb = 0   },
             BASE_RECOIL_IMPULSE                 = { lo = 1, hi = 20,     fb = 0   },
         }
-        local savedDefault = {}   -- your value BEFORE the first change (for Reset Default)
-
-        local cache = {}   -- key -> filtered getgc entries (so Apply/Reset never re-scan the whole GC)
+        -- Cross-run cache: getgc addresses stay valid for as long as you STAY in one server (same
+        -- game.JobId = same Lua VM), and _G survives a script re-run -- so the scan is stashed in _G
+        -- keyed by JobId. Re-running Requiem in the same server reuses it INSTANTLY (no re-scan); only
+        -- a REJOIN (new JobId -> fresh Lua heap -> new addresses) forces another scan.
+        local JOB = ""
+        pcall(function() JOB = tostring(game.JobId or "") end)
+        local prevG = _G.RequiemCharVals
+        local reuse = type(prevG) == "table" and prevG.job == JOB and type(prevG.cache) == "table"
+        local cache        = (reuse and prevG.cache) or {}          -- key -> filtered getgc entries
+        local savedDefault = (reuse and prevG.savedDefault) or {}    -- your value BEFORE the first change (Reset Default)
+        local warmed = false
+        -- On reuse, drop any key whose cached address stopped reading a sane number (config rebuilt this
+        -- session) so it re-scans lazily; the rest stay instant.
+        if reuse and type(memory_read) == "function" then
+            for k, entries in pairs(cache) do
+                local cfg, e = CFG[k], entries[1]
+                if cfg and e and e.addr then
+                    local ok, r = pcall(memory_read, "double", e.addr)
+                    if not (ok and type(r) == "number" and r == r and r >= cfg.lo and r <= cfg.hi) then
+                        cache[k] = {}
+                    end
+                end
+            end
+        end
+        for _, entries in pairs(cache) do if #entries > 0 then warmed = true; break end end
+        _G.RequiemCharVals = { job = JOB, cache = cache, savedDefault = savedDefault, warmed = warmed }
         local function notif(t, m, d) uiNotify(t, m, d or 3) end
         local function keep(cfg, e)   -- is this getgc entry the real numeric config value (not a hash decoy)?
             if type(e) ~= "table" or e.type ~= "number" then return false end
@@ -6476,18 +6535,22 @@ end)()  -- /Requiem UI smooth engine
             for k in pairs(CFG) do keys[#keys + 1] = k; if not cache[k] then cache[k] = {} end end
             local ok, entries = pcall(function() return getgc(keys) end)   -- getgc accepts a key LIST
             if not ok or type(entries) ~= "table" then return false end
+            local found = 0
             for _, e in pairs(entries) do
                 local cfg = e and CFG[e.key]
                 if cfg and keep(cfg, e) then
-                    local c = cache[e.key]; c[#c + 1] = e
+                    local c = cache[e.key]; c[#c + 1] = e; found = found + 1
                     if savedDefault[e.key] == nil then savedDefault[e.key] = tonumber(e.value) end
                 end
             end
-            return true
+            if found > 0 then warmed = true; if _G.RequiemCharVals then _G.RequiemCharVals.warmed = true end end
+            return found > 0
         end
 
         -- cached entries for a key; lazily sweep just that one key if the cache is still empty
         local function entriesFor(key)
+            if cache[key] and #cache[key] > 0 then return cache[key] end
+            if not warmed then pcall(warm) end            -- first use this session: ONE sweep for ALL keys
             if cache[key] and #cache[key] > 0 then return cache[key] end
             local cfg = CFG[key]; if not cfg then return {} end
             local ok, entries = pcall(function() return getgc(key) end)
@@ -6500,6 +6563,7 @@ end)()  -- /Requiem UI smooth engine
                 end
             end
             cache[key] = safe
+            if #safe > 0 then warmed = true; if _G.RequiemCharVals then _G.RequiemCharVals.warmed = true end end
             return safe
         end
 
@@ -6518,8 +6582,29 @@ end)()  -- /Requiem UI smooth engine
             return true
         end
 
+        -- ===== Character-tab LOCK GATE =====================================================
+        -- The VISUAL lock -- a dim over ONLY this panel + a centered "Load Values" popup -- is drawn by
+        -- the REQUIEM engine (drawCharLock), positioned with _G.RQGeo (the panel rect the patched INS-ui
+        -- fork publishes each frame). Here we just expose the load state + trigger to that engine, and
+        -- hard-block pin actions until loaded (the scrim is visual only; clicks still reach the lib).
+        GUI.CharIsLoaded = function() return warmed end
+        GUI.CharLoad = function()
+            if warmed then return end
+            task.spawn(function()
+                notif("Values", "Scanning memory... (~15s freeze)", 2)
+                pcall(warm)
+                notif("Values", warmed and "Loaded - pins are instant now" or "Failed - join a round, then retry", warmed and 3 or 4)
+            end)
+        end
+        local function gateOK()
+            if warmed then return true end
+            notif("Character", "Locked - use the Load Values popup on this tab first", 2)
+            return false
+        end
+
         -- Apply/Reset run in a background task so even the first (cache-warming) sweep can't freeze the click.
         local function applyMany(title, keys, vals)
+            if not gateOK() then return end
             task.spawn(function()
                 local okAll = true
                 for i, k in ipairs(keys) do if not apply(k, vals[i]) then okAll = false end end
@@ -6527,13 +6612,12 @@ end)()  -- /Requiem UI smooth engine
             end)
         end
         local function resetMany(title, keys)
+            if not gateOK() then return end
             task.spawn(function()
                 for _, k in ipairs(keys) do reset(k) end
                 notif(title, "Restored your defaults", 3)
             end)
         end
-
-        task.spawn(function() pcall(warm) end)        -- warm the cache once, in the background
 
         -- ---------- Eradicate (Sentinel chain capstone) ----------
         local secEr = tab:Section("Eradicate", "Left", "Chain kills / lockout / window")
@@ -6598,6 +6682,7 @@ end)()  -- /Requiem UI smooth engine
         end
         secVe:Toggle("Auto-Apply (Exp)", false, function(v)
             if not v then veAutoGen = veAutoGen + 1; return end   -- off -> invalidate the running loop
+            if not gateOK() then return end                       -- locked until Values are loaded
             veAutoGen = veAutoGen + 1
             local myGen = veAutoGen
             local natural, lastWrite = {}, {}   -- per-key: game's current natural value / my last write
@@ -6671,6 +6756,7 @@ end)()  -- /Requiem UI smooth engine
         local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
         local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the first zero
         secFire:Button("Apply Firearms", function()
+            if not gateOK() then return end
             task.spawn(function()
                 local okAll = true
                 for _, key in ipairs(FIRE_KEYS) do
@@ -6687,6 +6773,7 @@ end)()  -- /Requiem UI smooth engine
             end)
         end)
         secFire:Button("Restore Default", function()
+            if not gateOK() then return end
             task.spawn(function()
                 for _, key in ipairs(FIRE_KEYS) do
                     local orig = fireOrig[key]
