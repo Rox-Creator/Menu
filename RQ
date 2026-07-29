@@ -6491,10 +6491,20 @@ end)()  -- /Requiem UI smooth engine
             BURST_FORCE                         = { lo = 1, hi = 100000, fb = 280 },
             NON_SUCCESSFUL_PARRY_WINDOW_SECONDS = { lo = 0, hi = 60,     fb = 5   },
             -- Firearm no-spread / no-recoil (Musket + Flintlock; getgc hits ALL guns by name).
-            -- Real numerics: inaccuracy 2.5/7.5/8.5, recoil 2/4 -> range [1,20] spans them; every
-            -- other same-name GC entry is a string decoy (excluded by type). Restore is per-entry.
-            BASE_INACCURACY_OFFSET              = { lo = 1, hi = 20,     fb = 0   },
-            BASE_RECOIL_IMPULSE                 = { lo = 1, hi = 20,     fb = 0   },
+            -- Real numerics: inaccuracy 2.5/7.5/8.5/15, recoil 2/4; every other same-name GC entry
+            -- is a string decoy (excluded by type, not by range). Restore is per-entry.
+            -- lo is 0, NOT 1: once a value has been zeroed, a lo=1 window makes keep() reject it AND
+            -- makes the _G cache revalidator drop the key -> the re-scan finds nothing and Restore
+            -- silently no-ops. Live scan confirms there are no numeric decoys for these two keys.
+            BASE_INACCURACY_OFFSET              = { lo = 0, hi = 20,     fb = 0   },
+            BASE_RECOIL_IMPULSE                 = { lo = 0, hi = 20,     fb = 0   },
+            -- BlunderBuss live-tuning (test section below). PELLET_COUNT + SPREAD_REFERENCE_DISTANCE
+            -- are the write-NEVER fingerprint that picks the BlunderBuss's own config table out of
+            -- the 7 firearm configs (Trench shotgun is 9 / 60, BlunderBuss is 10 / 45); they are
+            -- scanned here only so the ONE Load Values sweep covers them too -- no second freeze.
+            PELLET_SPREAD_OFFSET                = { lo = 0, hi = 40,     fb = 835/100 },
+            PELLET_COUNT                        = { lo = 5, hi = 40,     fb = 10  },
+            SPREAD_REFERENCE_DISTANCE           = { lo = 10, hi = 200,   fb = 45  },
         }
         -- Cross-run cache: getgc addresses stay valid for as long as you STAY in one server (same
         -- game.JobId = same Lua VM), and _G survives a script re-run -- so the scan is stashed in _G
@@ -6521,7 +6531,11 @@ end)()  -- /Requiem UI smooth engine
             end
         end
         for _, entries in pairs(cache) do if #entries > 0 then warmed = true; break end end
-        _G.RequiemCharVals = { job = JOB, cache = cache, savedDefault = savedDefault, warmed = warmed }
+        -- `bb` rides along on the same JobId key: it holds the BlunderBuss's resolved GC slots + the
+        -- last value written to each, so a script RE-RUN in the same server reuses them instead of
+        -- re-fingerprinting a heap we have already edited (the stock-value test can only pass once).
+        local bbState = (reuse and type(prevG.bb) == "table" and prevG.bb) or {}
+        _G.RequiemCharVals = { job = JOB, cache = cache, savedDefault = savedDefault, warmed = warmed, bb = bbState }
         local function notif(t, m, d) uiNotify(t, m, d or 3) end
         local function keep(cfg, e)   -- is this getgc entry the real numeric config value (not a hash decoy)?
             if type(e) ~= "table" or e.type ~= "number" then return false end
@@ -6787,6 +6801,243 @@ end)()  -- /Requiem UI smooth engine
                 notif("Firearms", "Restored original spread + recoil", 3)
             end)
         end)
+
+        -- ---------- Blunderbuss (TEST): live-tune inaccuracy / recoil / pellet spread ----------
+        -- WHY THIS ISN'T JUST "getgc the key and write it": the BlunderBuss SHARES
+        -- BASE_INACCURACY_OFFSET 7.5 with the Musket and the Flintlock, and BASE_RECOIL_IMPULSE 2
+        -- with FOUR other guns. Writing by name (or by value) retunes every one of them.
+        --
+        -- So we FINGERPRINT the BlunderBuss's own config table instead: one weapon's constants live
+        -- in ONE Lua table, so their GC value-slots sit a few hundred bytes apart. Live scan
+        -- (2026-07-15) -- SPREAD_REFERENCE_DISTANCE 45 / MAX_PRECISION_SCALING 0.5 / inaccuracy 7.5 /
+        -- recoil 2 / spread 8.35 / PELLET_COUNT 10 all landed in ONE ~900-byte window, while the
+        -- nearest competing same-key entry was 5,000+ bytes out (a 30-80x margin).
+        --
+        -- Nearest-address ALONE is not safe: inaccuracy has 7 numeric entries but recoil only 6, so
+        -- one gun's table lacks the key entirely and an unbounded "closest" would silently pick a
+        -- DIFFERENT weapon. Every candidate must therefore (a) sit within BB_WINDOW of the anchor
+        -- AND (b) currently hold its stock value, and any 0-or->1 match ABORTS without writing.
+        --
+        -- The anchor uses only keys this section never writes (PELLET_COUNT 10 +
+        -- SPREAD_REFERENCE_DISTANCE 45 -- which are also exactly what separates the BlunderBuss from
+        -- the TrenchShotgun's 9 / 60), so our own edits can't destroy the fingerprint.
+        --
+        -- Writes go through applygc on a ONE-entry list = that single address only (bridge.lua /
+        -- reference §28: applygc writes the entries you hand it; setgc matches by name across the
+        -- whole heap and is the documented corruption path). Each write is compare-and-swap'd first
+        -- and read back after, so a stale address reports instead of scribbling somewhere random.
+        -- PELLET_COUNT is deliberately NOT tunable here.
+        local BB_STOCK  = { inacc = 75/10, recoil = 2, spread = 835/100 }  -- integer fractions: Matcha's
+                                                                           -- parser has choked on some decimal literals
+        local BB_KEY    = { inacc = "BASE_INACCURACY_OFFSET", recoil = "BASE_RECOIL_IMPULSE", spread = "PELLET_SPREAD_OFFSET" }
+        local BB_ORDER  = { "inacc", "recoil", "spread" }
+        local BB_LABEL  = { inacc = "Inacc", recoil = "Recoil", spread = "Spread" }
+        local BB_SCAN   = { "PELLET_COUNT", "SPREAD_REFERENCE_DISTANCE",
+                            "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE", "PELLET_SPREAD_OFFSET" }
+        local BB_WINDOW = 2048        -- max bytes from the anchor. Live: our own slots are 64-800 out
+                                      -- and the nearest OTHER gun's slot is 4936 -> 2.4x headroom.
+        local BB_EPS    = 1/1000000   -- NOT 1e-6: sci-notation literals can trip Matcha's parser
+                                      -- ("Malformed number"), which would kill the whole chunk
+        local BB_STEP   = 5/100       -- 0.05: the lib derives display precision from step MAGNITUDE,
+                                      -- so 0.05 is exact but 0.25 would render as 0.3
+        local bbStatus  = bbState.ok and "Slots resolved - press Apply" or "Idle - press Apply"
+        -- Last value written per slot, persisted per-server so a script RE-RUN seeds the sliders from
+        -- what is actually in memory instead of snapping the UI back to stock (which Auto-Apply would
+        -- then silently write back, undoing the tune).
+        local bbLive    = bbState.live or { inacc = BB_STOCK.inacc, recoil = BB_STOCK.recoil, spread = BB_STOCK.spread }
+        bbState.live    = bbLive
+        local bbVal     = { inacc = bbLive.inacc, recoil = bbLive.recoil, spread = bbLive.spread }
+
+        -- getgc reports .addr as a number in-VM but as a hex string on some builds -> take both.
+        local function bbAddr(e)
+            if type(e) ~= "table" then return nil end
+            local a = e.addr
+            if type(a) == "number" then return a end
+            if type(a) == "string" then return tonumber(a) or tonumber((a:gsub("^0[xX]", "")), 16) end
+            return nil
+        end
+        local function bbNum(v) local n = tonumber(v); if n and n == n then return n end return nil end
+        local function bbNear(a, b) return a ~= nil and b ~= nil and math.abs(a - b) <= BB_EPS end
+
+        -- ONE snapshot for all five keys. This is load-bearing: entriesFor() re-scans a key whose
+        -- cache list is EMPTY and never re-scans one that is populated, so the shotgun-only anchor
+        -- keys could come from a fresh sweep while inaccuracy/recoil came from an older one. In that
+        -- split the BlunderBuss's own inaccuracy slot may be absent from the candidate list entirely,
+        -- and the nearest survivor is a Musket (same stock 7.5 / 2) -- an invisible mis-resolve that
+        -- no later check could catch. Reading one snapshot makes that impossible.
+        -- Prefer the Load Values sweep (already paid for); only if the BlunderBuss wasn't resident
+        -- then do we spend one dedicated getgc, rate-limited so a retry can't become a scan loop.
+        local function bbSnapshot()
+            local snap = {}
+            for _, k in ipairs(BB_SCAN) do
+                snap[k] = {}
+                for _, e in ipairs(cache[k] or {}) do
+                    if e and e.key == k and e.type == "number" and bbAddr(e) and bbNum(e.value) then
+                        local t = snap[k]; t[#t + 1] = e
+                    end
+                end
+            end
+            if #snap.PELLET_COUNT > 0 and #snap.PELLET_SPREAD_OFFSET > 0 then return snap end
+            local now = os.clock()
+            if bbState.lastScan and (now - bbState.lastScan) < 20 then return snap end
+            bbState.lastScan = now
+            local ok, raw = pcall(function() return getgc(BB_SCAN) end)
+            if not ok or type(raw) ~= "table" then return snap end
+            local fresh = {}
+            for _, k in ipairs(BB_SCAN) do fresh[k] = {} end
+            for _, e in pairs(raw) do
+                if type(e) == "table" and e.type == "number" and fresh[e.key]
+                    and bbAddr(e) and bbNum(e.value) then
+                    local t = fresh[e.key]; t[#t + 1] = e
+                end
+            end
+            return fresh
+        end
+
+        -- Anchor = a PELLET_COUNT==10 slot with a SPREAD_REFERENCE_DISTANCE==45 slot beside it
+        -- (the TrenchShotgun, the only other pellet gun, is 9 / 60). Ambiguity aborts.
+        local function bbAnchor(snap)
+            local seen, hits = {}, {}
+            for _, pc in ipairs(snap.PELLET_COUNT) do
+                if bbNear(bbNum(pc.value), 10) then
+                    local pa = bbAddr(pc)
+                    for _, sr in ipairs(snap.SPREAD_REFERENCE_DISTANCE) do
+                        if bbNear(bbNum(sr.value), 45) and math.abs(pa - bbAddr(sr)) <= BB_WINDOW then
+                            local k = string.format("%.0f", pa)   -- %.0f, not tostring: big addresses
+                            if not seen[k] then                   -- would render in scientific notation
+                                seen[k] = true
+                                hits[#hits + 1] = pa
+                            end
+                        end
+                    end
+                end
+            end
+            if #hits == 0 then return nil, "BlunderBuss not in memory - equip one, then retry" end
+            if #hits > 1 then return nil, "ambiguous (" .. #hits .. " matching tables) - wrote nothing" end
+            return hits[1]
+        end
+
+        -- Each slot must be the ONLY entry of its key inside the window (a moat: a second one means
+        -- another gun's table is co-located and we cannot tell them apart) AND still hold its stock
+        -- value. Anything else aborts without writing.
+        local function bbResolveFresh()
+            local snap = bbSnapshot()
+            local anchor, why = bbAnchor(snap)
+            if not anchor then return nil, why end
+            local out = {}
+            for _, slot in ipairs(BB_ORDER) do
+                local key, cands = BB_KEY[slot], {}
+                for _, e in ipairs(snap[key]) do
+                    if math.abs(bbAddr(e) - anchor) <= BB_WINDOW then cands[#cands + 1] = e end
+                end
+                if #cands == 0 then return nil, key .. " missing near anchor - wrote nothing" end
+                if #cands > 1 then return nil, "another gun's " .. key .. " is co-located - wrote nothing" end
+                if not bbNear(bbNum(cands[1].value), BB_STOCK[slot]) then
+                    return nil, key .. " not at stock (" .. tostring(cands[1].value) .. ") - wrote nothing"
+                end
+                out[slot] = cands[1]
+            end
+            return out
+        end
+
+        -- Resolve once per server, then reuse: after the first write the stock-value test can never
+        -- pass again. Same Lua VM = same addresses (Luau's GC never moves objects); a rejoin makes a
+        -- new JobId, which rebuilds the whole cache against a freshly-stock game. NOTE: the latch is
+        -- set by bbApply only after all three writes verify, so a bad resolve is never made sticky.
+        local function bbResolve()
+            if bbState.ok and bbState.slots then return bbState.slots end
+            return bbResolveFresh()
+        end
+
+        -- One slot: sanity-check the address still reads a plausible value for this key, write via a
+        -- ONE-entry applygc, then read back to prove it landed. The check is a RANGE not an equality:
+        -- identity was already established at resolve time, so its only job here is catching a
+        -- dangling pointer -- and an equality check would deadlock the section the moment the
+        -- "Apply Firearms" button above zeroes these same slots.
+        local function bbWriteSlot(slot, e, value)
+            local a = bbAddr(e)
+            if not a then return false, "no address" end
+            if type(applygc) ~= "function" then return false, "applygc unavailable" end
+            -- fail closed: without a read-back we cannot prove anything, so we refuse rather than
+            -- report a green "Applied" for a write that may never have happened
+            if type(memory_read) ~= "function" then return false, "Unsafe LuaU off" end
+            local cfg = CFG[e.key]
+            local ok, cur = pcall(memory_read, "double", a)
+            cur = ok and bbNum(cur) or nil
+            if cur == nil then return false, "unreadable" end
+            if not (cfg and cur >= cfg.lo and cur <= cfg.hi) then
+                return false, "slot moved (" .. tostring(cur) .. ") - rejoin"
+            end
+            pcall(function() applygc({ e }, e.key, value) end)
+            local ok2, now = pcall(memory_read, "double", a)
+            now = ok2 and bbNum(now) or nil
+            if not bbNear(now, value) then return false, "write rejected" end
+            bbLive[slot] = value
+            return true
+        end
+
+        local function bbApply(vals, tag, quiet)
+            local slots, why = bbResolve()
+            if not slots then
+                bbStatus = "FAILED: " .. tostring(why)
+                if not quiet then notif("Blunderbuss", bbStatus, 5) end
+                return
+            end
+            local okAll, parts = true, {}
+            for _, slot in ipairs(BB_ORDER) do
+                local ok, err = bbWriteSlot(slot, slots[slot], vals[slot])
+                if ok then
+                    parts[#parts + 1] = string.format("%s %.2f", BB_LABEL[slot], vals[slot])
+                else
+                    okAll = false
+                    parts[#parts + 1] = BB_LABEL[slot] .. " " .. tostring(err)
+                end
+            end
+            -- only make the resolution sticky once every write has been verified
+            if okAll then bbState.ok, bbState.slots = true, slots end
+            bbStatus = (okAll and tag or "PARTIAL") .. ": " .. table.concat(parts, " | ")
+            if not quiet then notif("Blunderbuss", bbStatus, okAll and 3 or 5) end
+        end
+
+        local secBB = tab:Section("Blunderbuss (Test)", "Right", "BlunderBuss ONLY - other guns untouched")
+        secBB:Label(function() return bbStatus end)
+        secBB:Slider("Inaccuracy", bbVal.inacc, BB_STEP, 0, BB_STOCK.inacc, "",
+            function(v) bbVal.inacc = tonumber(v) or bbVal.inacc end,
+            "Aim-point scatter, ramped by distance. 0 = dead centre. Stock 7.5")
+        secBB:Slider("Recoil", bbVal.recoil, BB_STEP, 0, BB_STOCK.recoil, "",
+            function(v) bbVal.recoil = tonumber(v) or bbVal.recoil end,
+            "Camera kick impulse. 0 = no kick. Stock 2")
+        secBB:Slider("Pellet Spread", bbVal.spread, BB_STEP, 0, BB_STOCK.spread, "",
+            function(v) bbVal.spread = tonumber(v) or bbVal.spread end,
+            "Pellet cone radius (x max(0.5, accuracy)). 0 = all 10 pellets dead centre. Stock 8.35")
+        secBB:Button("Apply Blunderbuss", function()
+            if not gateOK() then return end
+            task.spawn(function() bbApply(bbVal, "Applied") end)
+        end)
+        secBB:Button("Restore Stock", function()
+            if not gateOK() then return end
+            -- reset the slider-backed values too, or Auto-Apply's next tick writes the tune back
+            bbVal.inacc, bbVal.recoil, bbVal.spread = BB_STOCK.inacc, BB_STOCK.recoil, BB_STOCK.spread
+            task.spawn(function() bbApply(BB_STOCK, "Restored") end)
+        end)
+        local bbAutoGen = 0
+        secBB:Toggle("Auto-Apply", false, function(on)
+            bbAutoGen = bbAutoGen + 1                     -- off -> invalidate the running loop
+            if not on then return end
+            if not gateOK() then return end
+            local myGen = bbAutoGen
+            task.spawn(function()
+                local last = {}
+                while bbAutoGen == myGen and GUI.Running do
+                    if not (bbNear(last.inacc, bbVal.inacc) and bbNear(last.recoil, bbVal.recoil)
+                        and bbNear(last.spread, bbVal.spread)) then
+                        last.inacc, last.recoil, last.spread = bbVal.inacc, bbVal.recoil, bbVal.spread
+                        bbApply(bbVal, "Auto", true)      -- quiet: status shows in the Label, no toasts
+                    end
+                    task.wait(1/2)
+                end
+            end)
+        end):Tooltip("Re-applies within ~0.5s of moving a slider, so you can tune while shooting")
     end)
 
     -- ===== Tab: Logs =====
