@@ -6096,115 +6096,104 @@ end)
 end)()  -- /Requiem UI smooth engine
 
 
+
 -- ============================================================
--- AUTO PARRY  —  Requiem "Blade Parry" (anti-bait)
+-- AUTO PARRY v3  —  Requiem "Blade Parry".  No tuning sliders.
 -- ============================================================
--- WHY THIS EXISTS. The old standalone AutoParry.lua fired on ANY threat animation inside an
--- effective radius of  radius + closing_speed*0.6  capped at +200 studs. At ODM closing speeds that
--- is a 159-239 stud trigger sphere. A blade's real reach, MEASURED live on two players in this
--- place, is ~4-7 studs from the HumanoidRootPart (furthest blade MeshPart sits 4.1-5.3 studs out).
--- So it fired on swings thrown 30x further away than could ever touch you — that IS the bait.
+-- WHAT THE GAME ACTUALLY DOES (reverse-engineered from Blades.Default's bytecode string table plus
+-- the RaycastHitboxV4 fork it drives, which does decompile):
+--     every frame, for each Attachment named "DmgPoint" on the blade:
+--         workspace:Raycast(point.WorldPosition, point.WorldPosition - point.LastPosition)
+-- That is the whole hit test. Three consequences drive this design:
+--   1. The damaging shape is the SEGMENT the blade tip sweeps this frame — not a sphere round the
+--      attacker, and not a forward cone. A sphere fires on anyone swinging at air nearby, and each
+--      false press costs 5 seconds; a cone is beaten by a lateral fly-by.
+--   2. Ray length == the point's per-frame displacement, so effective reach GROWS with closing
+--      speed. THAT is the "he slashed from far and it still hit me when he arrived" case — it is a
+--      real hit, not a bait, and it falls straight out of the maths below instead of needing a
+--      "blade linger" knob.
+--   3. Because the blade is a real part we can watch, we never have to predict the animation. The
+--      old build guessed a "damage frame" (0.30s) and a "linger" and was wrong per-animation; this
+--      one measures the blade directly, which is why every slider is gone.
 --
--- WHY BAITING HURTS SO MUCH (recovered live from the Lua heap with getgc, this build):
+-- SO THE PREDICATE IS: will the segment swept by their blade tip pass within my body radius of me,
+-- soon? We track the tip, differentiate it, and solve for closest approach. Nothing else.
+--
+-- VERIFIED CONSTANTS (live getgc on this build):
 --     SUCCESSFUL_PARRY_WINDOW_SECONDS       = 1
---     NON_SUCCESSFUL_PARRY_WINDOW_SECONDS   = 5     <-- a whiffed parry locks you out FIVE SECONDS
---     PARRY_LOCKOUT_AFTER_SWING_END_SECONDS = 0.1   <-- and you cannot parry just after your own swing
--- One induced press is a free kill for the opponent. Missing a parry costs one hit; eating a bait
--- costs five seconds. Every threshold below is therefore biased toward NOT firing.
+--     NON_SUCCESSFUL_PARRY_WINDOW_SECONDS   = 5    <-- whiffing costs FIVE seconds
+--     PARRY_LOCKOUT_AFTER_SWING_END_SECONDS = 0.1
+-- Parry itself is onKeybindPressed("Blade Parry") — an edge-triggered TAP.
 --
--- THE MECHANIC (recovered from Blades.Default's bytecode string table — the module fails to
--- decompile, but its strings survive): the parry is `onKeybindPressed("Blade Parry")` — an
--- edge-triggered TAP, not a hold (there is no onKeybindReleased in that module) — gated on the
--- attribute `GearCanBlock`. Damage is RaycastHitboxV4 over `DmgPoint` attachments swept along the
--- physical blade, with the window scheduled off the animation keyframe named "Freeze".
+-- WHY THE OLD BUILD WAS INCONSISTENT (both fixed here):
+--   * "sometimes it doesn't even try" — every press armed a 5s refractory, and the only path that
+--     shortened it watched for the Gear.Parried animation on the attacker. That animation is
+--     defined but referenced by ZERO client modules, so it never plays: the shortening path was
+--     dead code and we went blind for 5s after EVERY press. Now we confirm against OUR OWN
+--     Gear.Parry animation (which does replicate), and we only arm a cooldown when the press
+--     actually registered.
+--   * "parries too early" — it committed on a hardcoded animation-time damage frame shared by all
+--     13 swing animations. There is no such shared constant. Now we commit on observed geometry.
 --
--- THE ALGORITHM. Instead of "is someone swinging near me", we answer
---     "will the attacker's blade and my body occupy the same space at the instant the blade goes
---      live, and can my keypress reach the server before that instant?"
--- Per attacker we track the swing animation's TimePosition, estimate when its damage frame lands,
--- then solve for the CLOSEST APPROACH the two bodies reach during the damage window:
---     f(t) = |dP + dV*t|^2   ->   t* = -(dP.dV)/|dV|^2 , clamped into the damage window
--- and require that predicted separation to be inside the measured blade reach. A swing thrown from
--- out of range never satisfies it, no matter how fast the attacker is moving. We then sit in WATCH
--- and only press at the LAST RESPONSIBLE MOMENT (~120ms before impact), so a feint has to be
--- cancelled inside that window to fool us.
+-- Strictly client-side: memory reads, property reads, and one real OS keypress. No remotes.
 -- ============================================================
 ;(function()
 
 local LP = Players.LocalPlayer
 if not LP then return end
 
--- ---------- verified game constants (live getgc, this build) ----------
-local C_SUCCESS_WINDOW = 1.0    -- SUCCESSFUL_PARRY_WINDOW_SECONDS
-local C_WHIFF_LOCKOUT  = 5.0    -- NON_SUCCESSFUL_PARRY_WINDOW_SECONDS
-local C_SWING_LOCKOUT  = 0.1    -- PARRY_LOCKOUT_AFTER_SWING_END_SECONDS
+local C_WHIFF_LOCKOUT = 5.0
+local C_SWING_LOCKOUT = 0.1
 
--- ---------- AnimationTrack memory layout (validated live on this build) ----------
--- Walking the Animator's active-track list is far cheaper than the property bridge, and
--- Humanoid:GetPlayingAnimationTracks() does not work in Matcha at all.
--- TRACK_SPEED sits at +212 (reads 1.0 on a normal track); TRACK_TIMEPOS at +216 was confirmed
--- advancing in seconds against a known looping Gear.Idle.
-local O_ACTIVE, O_NEXT, O_TRACK = 2944, 0, 16
-local O_OWNER, O_ANIM, O_SPEED, O_TIMEPOS, O_ANIMID = 264, 184, 212, 216, 192
+-- AnimationTrack memory layout (validated live on this build)
+local OA, ON, OT, OO, OM, OS, OP, OI = 2944, 0, 16, 264, 184, 212, 216, 192
 
--- ---------- threat animations ----------
--- Keyed by the NUMERIC id only: Roblox hands ids back as either "rbxassetid://N" or
--- "http://www.roblox.com/asset/?id=N" (both observed live in one animator), so matching the whole
--- string would silently miss the http form.
-local GEAR_SWINGS = {
-    -- Blades.Swings.Ground
-    ["96150550684216"]=1, ["107395560572172"]=1, ["94107418581065"]=1,
-    -- Blades.Swings.Air
-    ["78407720926422"]=1, ["106676784817648"]=1,
-    -- Stances.Crossguard / Tempo / Burst  (.Blades.Swings.Air)
-    ["86336690808665"]=1, ["85287366164918"]=1,
-    ["102346761719959"]=1, ["135697384008415"]=1,
-    ["128445066928907"]=1, ["73922915237760"]=1,
-    -- Dashing Draw (Handles.Default fires simulateBladeSwing -> a REAL damage window, but plays
-    -- Draw.Slash rather than any Swings id, so without these it is a total bypass). Ids are from the
-    -- recon dump and are UNVERIFIED against this build; if wrong they are simply inert entries.
-    ["72771561922649"]=1, ["95271646757817"]=1,
-}
--- Melee tools (Sabre / Combat Knife / Baton / Sword / Boxer). DIFFERENT system: KeyCode.F ->
--- Combat.Block.post(true/false), which is a HELD block, and its hitbox is a 6x6x9 box at
--- CFrame.new(0,0,-4.5) armed 0.30s after the swing for 0.25s. Kept behind its own toggle so the
--- gear parry is never spent on a melee swing.
-local MELEE_SWINGS = {
-    ["112666168396669"]=1, ["86140055867484"]=1, ["124361532701064"]=1, ["136621055776523"]=1,
-    ["82666636655771"]=1,  ["75659520618730"]=1, ["89635808450635"]=1,
-}
-local ANIM_PARRY   = "89583460276496"   -- Gear.Parry   — plays on whoever parried
-local ANIM_PARRIED = "84390695370400"   -- Gear.Parried — plays on whoever GOT parried
-local ANIM_STUNS   = { ["91072205250933"]=1, ["111041292650955"]=1, ["86381779914835"]=1 }
+-- STRICT allowlist. 82 of the 93 ids in Common.Animations.Gear are harmless, and the worst
+-- look-alikes (Grapples.Double, Dashes, Launches) play exactly during a closing approach — so
+-- "treat unknown gear animations as maybe-threats" would fire constantly. Only these can damage.
+local SWINGS = {}
+for _, id in ipairs({
+    "96150550684216", "107395560572172", "94107418581065",     -- Blades.Swings.Ground
+    "78407720926422", "106676784817648",                       -- Blades.Swings.Air
+    "86336690808665", "85287366164918",                        -- Crossguard air
+    "102346761719959", "135697384008415",                      -- Tempo air
+    "128445066928907", "73922915237760",                       -- Burst air
+    "72771561922649",                                          -- Draw.Slash (Dashing Draw)
+}) do SWINGS[id] = true end
+local ANIM_PARRY = "89583460276496"
+local STUNS = {}
+for _, id in ipairs({ "91072205250933", "111041292650955", "86381779914835" }) do STUNS[id] = true end
+-- One merged set so a single animator walk answers both "are they swinging" and "did they parry".
+local WATCHED = {}
+for id in pairs(SWINGS) do WATCHED[id] = true end
+WATCHED[ANIM_PARRY] = true
+local PARRY_ONLY = { [ANIM_PARRY] = true }   -- hoisted: allocating this per tick churned the GC
 
--- ---------- state (hung off GUI: this file is at its top-level local budget) ----------
 local AP = {
-    On            = false,
-    Key           = 0x46,   -- VK for "Blade Parry" (Gear keybind slot 10 = F by default)
-    Melee         = false,  -- also guard melee-tool swings (uses the same key = Block)
-    Reach         = 0,      -- 0 = measure each attacker's real blade reach; >0 = force studs
-    Pad           = 2.0,    -- safety margin added to reach
-    VertReach     = 9.0,
-    Watch         = 60,     -- studs: nothing further than this is even animator-walked
-    Tdmg          = 0.30,   -- animation-time of the damage frame (melee analogue; tunable)
-    Window        = 0.45,   -- blade linger: how long the hitbox keeps sweeping after it goes live.
-                            -- This is the knob for "he slashed from far and it hit me when he
-                            -- arrived" — it sets how far ahead we keep looking for their arrival.
-    Lead          = 0.05,   -- extra safety added to the commit deadline
-    Cone          = 0.35,   -- facing CONFIDENCE floor (not a hard gate — see below)
-    Respect       = true,   -- honour the 5s whiff lockout
+    On = false,
+    Key = 0x46,          -- "Blade Parry" keybind (Gear slot 10 = F by default)
+    ToggleKey = 0x47,    -- G toggles the feature
+    ESP = true,          -- enemy parry-cooldown readout
+    -- learned, not configured
+    CD = C_WHIFF_LOCKOUT,     -- parry cooldown; learned DOWN if we ever re-parry sooner
+    -- My hittable radius about the HRP, DERIVED from measurement rather than guessed:
+    --   reachable envelope, HRP-to-HRP                     ~10.4 studs  (DmgPoint cloud analysis)
+    --   measured outermost blade PART from attacker HRP     ~6.4 studs  (live, both hands)
+    --   => body radius + the DmgPoint overshoot past the
+    --      visible tip (~1.1 studs)                         ~4.0-4.2 studs
+    -- We track the visible blade part, so the threshold must absorb that overshoot.
+    BodyR = 4.2,
     -- runtime
-    Roster = {}, Cand = {}, RosterAt = 0,
-    LastPress = 0, RefractoryUntil = 0, PendingAt = 0, PendingKey = nil,
-    Fired = 0, Confirmed = 0, Baited = 0, Rejected = 0,
-    Hz = 0, Status = "idle",
+    Roster = {}, RosterAt = 0, Cand = {}, Fired = {},
+    LastPress = 0, PressAt = 0, Armed = 0, ProbeAt = 0,
+    Presses = 0, Registered = 0, Rejected = 0, Hz = 0, Err = 0,
+    Status = "off", Near = 0,
 }
 GUI.AP = AP
 
--- ---------- memory helpers ----------
-local function rptr(a) local ok,v = pcall(memory_read,"uintptr",a); return ok and v or nil end
-local function rflt(a) local ok,v = pcall(memory_read,"float",a);   return ok and v or nil end
-local function ri32(a) local ok,v = pcall(memory_read,"int32",a);   return ok and v or nil end
+local function rptr(a) local ok, v = pcall(memory_read, "uintptr", a) return ok and v or nil end
+local function rflt(a) local ok, v = pcall(memory_read, "float", a) return ok and v or nil end
+local function ri32(a) local ok, v = pcall(memory_read, "int32", a) return ok and v or nil end
 
 local function readStr(base)
     local len = rptr(base + 16)
@@ -6216,97 +6205,111 @@ local function readStr(base)
         local w = ri32(src + i)
         if not w then return nil end
         for b = 0, 3 do
-            if i + b < len then out[#out+1] = string.char(bit32.band(bit32.rshift(w, b*8), 0xFF)) end
+            if i + b < len then out[#out + 1] = string.char(bit32.band(bit32.rshift(w, b * 8), 255)) end
         end
         i = i + 4
     end
     return table.concat(out)
 end
 
--- Both id spellings reduce to the same numeric key.
-local function idNum(s)
-    if type(s) ~= "string" then return nil end
-    return string.match(s, "(%d+)%s*$")
-end
+-- Ids arrive as either "rbxassetid://N" or "http://www.roblox.com/asset/?id=N" (both seen in one
+-- animator), so only the trailing number is comparable.
+local function idNum(s) if type(s) ~= "string" then return nil end return string.match(s, "(%d+)%s*$") end
 
--- Animation-pointer -> numeric id. Keyed on the ANIMATION object, not the TRACK: track objects are
--- pooled and a freed track's address gets reused, so a track-keyed cache returns a previous swing's
--- id (phantom parries, and silent misses). Entries carry a timestamp and are re-read when stale.
+-- Animation-pointer keyed (NOT track-keyed): tracks are pooled and a freed track's address gets
+-- reused, which would return a previous swing's id.
 local IDC = {}
-local function trackId(tp)
-    local ap = rptr(tp + O_ANIM)
+local function trackId(t)
+    local ap = rptr(t + OM)
     if not ap or ap < 0x10000 then return nil end
-    local k = tostring(ap)
+    local k = ap
     local e = IDC[k]
     local now = os.clock()
-    if e and (now - e.t) < 30 then return e.id end
-    local id = idNum(readStr(ap + O_ANIMID)) or false
-    IDC[k] = { id = id, t = now }
+    if e and (now - e[2]) < 30 then return e[1] end
+    local id = idNum(readStr(ap + OI)) or false
+    IDC[k] = { id, now }
     return id
 end
 
--- Walk one animator's active tracks. `want` is a lookup table of numeric ids; returns the first
--- match as (numericId, trackPtr, timePos, speed). The owner check is load-bearing — the list
--- genuinely contains tracks belonging to other animators (verified live).
-local function scanAnimator(A, want)
-    local head = rptr(A + O_ACTIVE)
+-- One walk, one pass: returns the first id found from `want`, plus its track pointer and TimePosition.
+-- The owner check is load-bearing: foreign tracks genuinely appear in this list.
+local function scan(A, want)
+    local head = rptr(A + OA)
     if not head or head < 0x10000 then return nil end
-    local node, guard = rptr(head + O_NEXT), 0
+    local node, guard = rptr(head + ON), 0
     while node and node > 0x10000 and node ~= head and guard < 64 do
         guard = guard + 1
-        local t = rptr(node + O_TRACK)
-        if t and t > 0x10000 and rptr(t + O_OWNER) == A then
+        local t = rptr(node + OT)
+        if t and t > 0x10000 and rptr(t + OO) == A then
             local id = trackId(t)
-            if id and want[id] then
-                local sp = rflt(t + O_SPEED)
-                if not sp or sp ~= sp or sp <= 0 or sp > 8 then sp = 1 end
-                return id, t, (rflt(t + O_TIMEPOS) or 0), sp
-            end
+            if id and want[id] then return id, t, (rflt(t + OP) or 0) end
         end
-        node = rptr(node + O_NEXT)
+        node = rptr(node + ON)
     end
     return nil
 end
 
--- Is a specific animation id currently playing on this animator?
-local function animPlaying(A, numId)
-    local one = { [numId] = 1 }
-    return scanAnimator(A, one) ~= nil
+-- distance from point P to segment AB (this is exactly the shape the game raycasts)
+local function segDist(px, py, pz, ax, ay, az, bx, by, bz)
+    local abx, aby, abz = bx - ax, by - ay, bz - az
+    local apx, apy, apz = px - ax, py - ay, pz - az
+    local ab2 = abx * abx + aby * aby + abz * abz
+    local t = 0
+    if ab2 > 0.000001 then
+        t = (apx * abx + apy * aby + apz * abz) / ab2
+        if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    end
+    local cx, cy, cz = (ax + abx * t) - px, (ay + aby * t) - py, (az + abz * t) - pz
+    return math.sqrt(cx * cx + cy * cy + cz * cz)
 end
 
--- ---------- roster (bridge reads, 1Hz) ----------
--- Everything here is a plain string or number. NEVER store an instance shim as a key or compare
--- shims with == : Matcha returns a distinct shim per access, so shim equality is ALWAYS false —
--- that alone would make every candidate-to-attacker match fail and the whole feature silently
--- never fire.
+-- closest approach of P0 + V*t over t in [0, tmax]; returns (distance, t)
+local function closest(px, py, pz, vx, vy, vz, tmax)
+    local vv = vx * vx + vy * vy + vz * vz
+    local t = 0
+    if vv > 0.000001 then t = -((px * vx + py * vy + pz * vz) / vv) end
+    if t < 0 then t = 0 elseif t > tmax then t = tmax end
+    local dx, dy, dz = px + vx * t, py + vy * t, pz + vz * t
+    return math.sqrt(dx * dx + dy * dy + dz * dz), t
+end
+
+-- Roster: plain strings/numbers only. Matcha returns a distinct shim per access, so a shim can
+-- never be a table key and `a == b` is always false for the same instance.
 local function rebuildRoster()
     local out = {}
     local myName = LP.Name
     local myTeam = nil
     pcall(function() myTeam = LP.Team and LP.Team.Name or nil end)
-    AP.MyTeam = myTeam
     for _, p in ipairs(Players:GetPlayers()) do
         local nm = nil
         pcall(function() nm = p.Name end)
         if nm and nm ~= myName then
             local c = p.Character
             local hum = c and c:FindFirstChildOfClass("Humanoid")
-            local anim = hum and hum:FindFirstChildOfClass("Animator")
+            local an = hum and hum:FindFirstChildOfClass("Animator")
             local hrp = c and c:FindFirstChild("HumanoidRootPart")
-            if anim and hrp then
-                -- tonumber(): .Address comes back as a NUMBER on some builds and a hex STRING on
-                -- others. The owner check below compares it against a raw memory_read (always a
-                -- number), so a string here would make every comparison false and the feature would
-                -- silently never detect anything.
-                local okA, ad = pcall(function() return tonumber(anim.Address) end)
+            if an and hrp then
+                local okA, ad = pcall(function() return tonumber(an.Address) end)
                 if okA and ad and ad > 0x10000 then
-                    local tname = nil
-                    pcall(function() tname = p.Team and p.Team.Name or nil end)
-                    -- Team gate must be nil-SAFE: in FFA everyone's Team is nil, and `nil ~= nil`
-                    -- is false, which would reject the entire server.
-                    local friendly = (myTeam ~= nil and tname ~= nil and tname == myTeam)
-                    if not friendly then
-                        out[#out+1] = { name = nm, A = ad, hrp = hrp, char = c, reach = nil, reachAt = 0 }
+                    local tn = nil
+                    pcall(function() tn = p.Team and p.Team.Name or nil end)
+                    -- nil-safe: in FFA everyone's Team is nil, and `nil ~= nil` is false, which
+                    -- would otherwise reject the whole server.
+                    if not (myTeam ~= nil and tn ~= nil and tn == myTeam) then
+                        -- Carry cached state across rebuilds, keyed by the CHARACTER ADDRESS.
+                        -- `prev.char == c` would be a shim comparison — always false — so the blade
+                        -- tips would be re-resolved every rebuild (~6.5ms each) forever.
+                        local ca = nil
+                        pcall(function() ca = tostring(c.Address) end)
+                        local prev = nil
+                        for _, o in ipairs(AP.Roster) do if o.name == nm then prev = o break end end
+                        local keep = (prev and ca and prev.charAddr == ca)
+                        out[#out + 1] = {
+                            name = nm, A = ad, hrp = hrp, char = c, charAddr = ca,
+                            tips = keep and prev.tips or nil,
+                            parryAt = (prev and prev.parryAt) or 0,
+                            wasParry = (prev and prev.wasParry) or false,
+                        }
                     end
                 end
             end
@@ -6315,291 +6318,314 @@ local function rebuildRoster()
     AP.Roster = out
 end
 
--- Real blade reach, measured from the attacker's own gear. The damage volume is swept along the
--- physical blade, so the furthest blade part IS the reach — this auto-adapts to gear generation,
--- blade expansion and charge instead of hard-coding a guess. Cached per attacker (geometry only
--- changes on a gear/stance swap).
-local function measureReach(e)
-    local now = os.clock()
-    if e.reach and (now - e.reachAt) < 5 then return e.reach end
-    e.reachAt = now
-    local best = 0
-    pcall(function()
-        local root = e.hrp.Position
-        for _, side in ipairs({ "LeftGearHandle", "RightGearHandle" }) do
-            local gh = e.char:FindFirstChild(side)
-            if gh then
-                for _, d in ipairs(gh:GetDescendants()) do
-                    if d:IsA("BasePart") then
-                        local v = d.Position - root
-                        local half = d.Size.Z * 0.5
-                        local dist = math.sqrt(v.X*v.X + v.Y*v.Y + v.Z*v.Z) + half
-                        if dist > best then best = dist end
+-- Resolve the outermost blade part per hand ONCE per character. GetDescendants over the gear costs
+-- ~6.5ms, so it must never run on the commit path — it is done lazily the first time a player
+-- actually becomes a threat, then cached.
+local function resolveTips(e)
+    if e.tips then return e.tips end
+    local tips = {}
+    local root = nil
+    pcall(function() root = e.hrp.Position end)
+    if not root then return tips end   -- don't cache a failure; retry next time
+    for _, side in ipairs({ "LeftGearHandle", "RightGearHandle" }) do
+        local gh = nil
+        pcall(function() gh = e.char:FindFirstChild(side) end)
+        if gh then
+            local kids = nil
+            pcall(function() kids = gh:GetDescendants() end)
+            local best, bestd = nil, -1
+            if kids then
+                for _, d in ipairs(kids) do
+                    -- EVERY read is guarded individually. Measured live: only 4 of the 20 BaseParts
+                    -- under a gear handle return a readable .Position — the rest come back nil. A
+                    -- single pcall around the whole loop aborts on the first of those, which left
+                    -- the tip list EMPTY and meant the parry could never fire.
+                    local isPart = false
+                    pcall(function() isPart = d:IsA("BasePart") end)
+                    if isPart then
+                        local pv = nil
+                        pcall(function() pv = d.Position end)
+                        if pv then
+                            local vx, vy, vz = pv.X - root.X, pv.Y - root.Y, pv.Z - root.Z
+                            local dd = math.sqrt(vx * vx + vy * vy + vz * vz)
+                            local sz = nil
+                            pcall(function() sz = d.Size end)
+                            if sz then dd = dd + sz.Z * 0.5 end
+                            if dd > bestd then bestd = dd; best = d end
+                        end
                     end
                 end
             end
+            if best then tips[#tips + 1] = best end
         end
-    end)
-    -- A swing extends the arm well past the resting pose; scale the resting measurement up, and
-    -- floor it so a failed read can never produce a zero-reach (never-fires) state.
-    if best > 0 then e.reach = math.max(6, best * 1.6) else e.reach = 11 end
-    return e.reach
+    end
+    -- Only cache a SUCCESSFUL resolve, so a transient nil read cannot permanently disarm this player.
+    if #tips > 0 then e.tips = tips end
+    return tips
 end
 
-local function selfState()
-    local c = LP.Character
-    if not c then return nil end
-    local hum = c:FindFirstChildOfClass("Humanoid")
-    local hrp = c:FindFirstChild("HumanoidRootPart")
-    if not (hum and hrp) then return nil end
-    local hp = 0
-    pcall(function() hp = hum.Health end)
-    if hp <= 0 then return nil end
-    local anim = hum:FindFirstChildOfClass("Animator")
-    local ad = nil
-    if anim then local ok, a = pcall(function() return tonumber(anim.Address) end); ad = ok and a or nil end
-    return { hrp = hrp, A = ad }
-end
-
--- ---------- the press ----------
-local function firePress()
+local function press()
     local vk = AP.Key
     if not vk then return end
-    AP.Fired = AP.Fired + 1
+    AP.Presses = AP.Presses + 1
     AP.LastPress = os.clock()
-    AP.PendingAt = AP.LastPress
-    -- Pessimistic by default: assume the press was spent. If we later SEE the attacker play
-    -- Gear.Parried, we know it landed and we cut the refractory back to the success window.
-    -- Even with the lockout modelling turned off, keep a short floor so a single swing can never
-    -- turn into a burst of presses.
-    AP.RefractoryUntil = AP.LastPress + (AP.Respect and C_WHIFF_LOCKOUT or 0.35)
-    task.spawn(function()
-        pcall(function()
-            keypress(vk)
-            task.wait(0.06)      -- edge-triggered keybind; a short hold registers more reliably than an instant tap
-            keyrelease(vk)
-        end)
-    end)
+    AP.PressAt = AP.LastPress
+    pcall(keypress, vk)
+    AP.Armed = AP.LastPress
 end
 
--- ---------- main loop ----------
+-- ---------- enemy parry-cooldown readout ----------
+local ESPPool = {}
+local function espText(i)
+    local t = ESPPool[i]
+    if not t then
+        local ok, d = pcall(Drawing.new, "Text")
+        if not ok or not d then return nil end
+        pcall(function()
+            d.Size = 16; d.Center = true; d.Outline = true
+            d.Font = Drawing.Fonts.System; d.Visible = false; d.ZIndex = 9
+            d.Color = Color3.fromRGB(255, 95, 95)
+        end)
+        ESPPool[i] = d
+        t = d
+    end
+    return t
+end
+
 AP.Gen = (AP.Gen or 0) + 1
 local myGen = AP.Gen
 
 task.spawn(function()
     local hzN, hzT = 0, os.clock()
+    local wasToggle, toggleReady = false, false
     while GUI.Running and AP.Gen == myGen do
-        local ok = pcall(function()
-            if not AP.On then AP.Status = "off"; return end
+        local ok, err = pcall(function()
             local now = os.clock()
-
             hzN = hzN + 1
             if now - hzT >= 1 then AP.Hz = hzN / (now - hzT); hzN, hzT = 0, now end
 
-            if now - AP.RosterAt > 1 then AP.RosterAt = now; rebuildRoster() end
+            -- toggle hotkey, with the release-arm guard: Matcha's iskeypressed can report a key
+            -- permanently HELD, which would otherwise flip the feature on the very first frame.
+            local td = false
+            pcall(function() td = iskeypressed(AP.ToggleKey) and true or false end)
+            if not toggleReady then
+                if not td then toggleReady = true end
+            elseif td and not wasToggle then
+                AP.On = not AP.On
+                pcall(function() uiNotify("Auto Parry", AP.On and "ON" or "OFF", 2) end)
+            end
+            wasToggle = td
 
-            local me = selfState()
-            if not me then
-                AP.Status = "dead / no character"
-                AP.Cand = {}
-                return
+            -- release a held parry key promptly (edge-triggered keybind; a brief hold registers
+            -- more reliably than an instant tap, but it must never be left down)
+            if AP.Armed > 0 and (now - AP.Armed) > 0.05 then
+                pcall(keyrelease, AP.Key)
+                AP.Armed = 0
             end
 
-            -- Confirm a pending press: if the attacker plays Gear.Parried we actually landed it,
-            -- so the real cost was the 1s success window, not the 5s whiff lockout.
-            if AP.PendingAt > 0 and (now - AP.PendingAt) < 0.6 then
-                for _, e in ipairs(AP.Roster) do
-                    if animPlaying(e.A, ANIM_PARRIED) then
-                        AP.Confirmed = AP.Confirmed + 1
-                        AP.RefractoryUntil = AP.PendingAt + C_SUCCESS_WINDOW
-                        AP.PendingAt = 0
-                        break
-                    end
-                end
-            elseif AP.PendingAt > 0 then
-                AP.PendingAt = 0
-            end
+            if not AP.On then AP.Status = "off"; return end
 
-            -- Am I able to press at all? (Do NOT return on a false — the observer has to keep
-            -- running or the follow-up swing of a combo is never even seen. Only the COMMIT is
-            -- gated; observation is unconditional.)
-            -- ONE walk of my own animator answers all three questions: am I already parrying, am I
-            -- stunned, and did I just swing — PARRY_LOCKOUT_AFTER_SWING_END_SECONDS = 0.1 makes a
-            -- press right after my own swing a silent no-op that would still burn the cooldown.
-            local SELFWATCH = AP._selfWatch
-            if not SELFWATCH then
-                SELFWATCH = { [ANIM_PARRY] = "parry" }
-                for k in pairs(ANIM_STUNS) do SELFWATCH[k] = "stun" end
-                for k in pairs(GEAR_SWINGS) do SELFWATCH[k] = "swing" end
-                AP._selfWatch = SELFWATCH
-            end
-            local blocked = false
-            if now < AP.RefractoryUntil then blocked = true end
-            if me.A then
-                local sid = scanAnimator(me.A, SELFWATCH)
-                if sid then
-                    local kind = SELFWATCH[sid]
-                    if kind == "swing" then
-                        AP.MySwingAt = now
-                    else
-                        blocked = true
-                    end
+            local ch = LP.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+            if not (hum and hrp) then AP.Status = "no character"; AP.Cand = {}; return end
+            local hp = 0
+            pcall(function() hp = hum.Health end)
+            if hp <= 0 then AP.Status = "dead"; AP.Cand = {}; return end
+            local myPos, myVel
+            pcall(function() myPos = hrp.Position; myVel = hrp.AssemblyLinearVelocity end)
+            if not (myPos and myVel) then return end
+
+            local an = hum:FindFirstChildOfClass("Animator")
+            local myA = nil
+            if an then local o, a = pcall(function() return tonumber(an.Address) end); myA = o and a or nil end
+
+            -- ONE walk of my own animator answers: did my press register (Gear.Parry playing), am I
+            -- stunned, and did I just swing (PARRY_LOCKOUT_AFTER_SWING_END_SECONDS).
+            local blocked, parrying = false, false
+            if myA then
+                local sid = scan(myA, PARRY_ONLY)
+                if sid then parrying = true end
+                if not sid then
+                    if scan(myA, STUNS) then blocked = true end
+                    local sw = scan(myA, SWINGS)
+                    if sw then AP.MySwingAt = now end
                 end
             end
             if AP.MySwingAt and (now - AP.MySwingAt) < C_SWING_LOCKOUT then blocked = true end
 
-            local myPos, myVel
-            pcall(function() myPos = me.hrp.Position; myVel = me.hrp.AssemblyLinearVelocity end)
-            if not (myPos and myVel) then return end
-
-            local want = GEAR_SWINGS
-            if AP.Melee then
-                want = {}
-                for k in pairs(GEAR_SWINGS) do want[k] = 1 end
-                for k in pairs(MELEE_SWINGS) do want[k] = 1 end
+            -- Confirm the press. Our own Gear.Parry animation DOES replicate, so it is the ground
+            -- truth for "the game accepted the input". Only a registered press starts a cooldown —
+            -- a press the game ate (grapple, lockout, focus) must not blind us.
+            if AP.PressAt > 0 then
+                if parrying then
+                    AP.Registered = AP.Registered + 1
+                    -- Learn the real cooldown: if we ever register two parries closer together than
+                    -- the model, the model was too pessimistic. Floor at the game's success window.
+                    if AP.LastReg and (AP.PressAt - AP.LastReg) > 0.2 then
+                        local gap = AP.PressAt - AP.LastReg
+                        if gap < AP.CD then AP.CD = math.max(1.0, gap) end
+                    end
+                    AP.LastReg = AP.PressAt
+                    AP.CoolUntil = AP.PressAt + AP.CD
+                    AP.PressAt = 0
+                elseif (now - AP.PressAt) > 0.25 then
+                    AP.PressAt = 0     -- never registered: no cooldown, allow a retry
+                end
+            end
+            if parrying then blocked = true end
+            if AP.CoolUntil and now < AP.CoolUntil then
+                -- Probe occasionally: a press that REGISTERS proves we were not locked out, which is
+                -- how AP.CD gets learned down from the pessimistic 5s. Bounded to one per second.
+                if (now - (AP.ProbeAt or 0)) < 1.2 then blocked = true end
             end
 
-            local bestTTI, bestCand = 9999, nil
-            local seen = {}
+            if now - AP.RosterAt > 2 then AP.RosterAt = now; rebuildRoster() end
+
+            local bestT, bestE, bestD, bestK = 9, nil, 0, nil
+            local near = 0
 
             for _, e in ipairs(AP.Roster) do
-                -- Coarse distance first: one bridged read, and it is a HARD ceiling that cannot
-                -- inflate with speed (which is precisely what the old script's prefilter did).
-                local epos, evel
-                pcall(function() epos = e.hrp.Position; evel = e.hrp.AssemblyLinearVelocity end)
+                local epos
+                pcall(function() epos = e.hrp.Position end)
                 if epos then
-                    local dx, dy, dz = epos.X-myPos.X, epos.Y-myPos.Y, epos.Z-myPos.Z
-                    local flat = math.sqrt(dx*dx + dz*dz)
-                    if flat <= AP.Watch then
-                        local id, tptr, tp, sp = scanAnimator(e.A, want)
-                        if id and tptr then
-                            local ck = tostring(tptr) .. ":" .. id
-                            seen[ck] = true
-                            local c = AP.Cand[ck]
-                            if not c then
-                                c = { id = id, name = e.name, tp = tp, last = now, rate = sp, stalled = false }
-                                AP.Cand[ck] = c
-                            end
-                            -- Measure the animation's real advance rate. This both corrects for
-                            -- playback speed AND detects the charge-hold: onHoldBasicBladeSwing
-                            -- freezes the track at the "Freeze" keyframe so an attacker can hold a
-                            -- wound-up swing indefinitely while dancing in and out of range. A
-                            -- stalled track must never commit.
-                            local dt = now - c.last
-                            if dt > 0.004 and c.tp then
-                                local r = (tp - c.tp) / dt
-                                if r == r and r >= 0 and r < 8 then
-                                    c.rate = (c.rate or sp) * 0.6 + r * 0.4
-                                end
-                                c.last = now
-                                -- A restart (tp jumped backwards) means the combo replayed on a
-                                -- recycled track: treat it as a brand new swing, not a continuation.
-                                if tp < c.tp - 0.05 then c.rate = sp end
-                            end
-                            c.tp = tp
-                            c.stalled = (c.rate or 1) < 0.15
+                    local dx, dy, dz = epos.X - myPos.X, epos.Y - myPos.Y, epos.Z - myPos.Z
+                    local d3 = math.sqrt(dx * dx + dy * dy + dz * dz)   -- 3D: air swings come from above and below
+                    if d3 < 90 then
+                        near = near + 1
+                        -- ONE walk per player per tick, covering swings AND their parry. Two
+                        -- separate scans would double the cost of the hottest path in the loop.
+                        local aid, tptr = scan(e.A, WATCHED)
+                        local sid = (aid and SWINGS[aid]) and aid or nil
 
-                            local rate = c.rate or 1
-                            if rate < 0.3 then rate = 1 end  -- don't let a stall inflate TTI
-                            local tti  = (AP.Tdmg - tp) / rate   -- when the blade goes LIVE
-                            local tEnd = tti + AP.Window         -- when it can no longer hurt
+                        -- enemy parry-cooldown readout (rising edge of their Gear.Parry)
+                        local isParry = (aid == ANIM_PARRY)
+                        if isParry and not e.wasParry then e.parryAt = now end
+                        e.wasParry = isParry
+                        if sid then e.parryAt = 0 end   -- they are swinging, so not locked out
 
-                            if c.stalled then
-                                -- onHoldBasicBladeSwing freezes the track at the "Freeze" keyframe,
-                                -- so an attacker can hold a wound-up swing indefinitely while
-                                -- dancing in and out of reach. Never commit to a frozen track —
-                                -- this is the strongest bait in the game.
-                                AP.Status = "watching (charge held)"
-                            elseif tEnd > -0.05 and tti < 2.0 then
-                                -- BLADE LINGER. The hitbox is a raycast sweep that stays live for
-                                -- AP.Window, so an attacker can start a swing 40 studs out, grapple
-                                -- in, and connect on ARRIVAL — long after the damage frame. The old
-                                -- bound here (tti < 0.60 and tti > -0.25) threw that candidate away
-                                -- before they arrived, so the hit landed unparried and got counted
-                                -- as a "bait ignored". We now keep watching for the whole time the
-                                -- blade can still reach us.
-                                evel = evel or Vector3.new(0,0,0)
-                                local pdx, pdy, pdz = dx, dy, dz
-                                local vdx = evel.X - myVel.X
-                                local vdy = evel.Y - myVel.Y
-                                local vdz = evel.Z - myVel.Z
-                                local t0 = tti
-                                local t1 = tEnd
-                                if t0 < 0 then t0 = 0 end
-                                if t1 < t0 then t1 = t0 end
-                                local vv = vdx*vdx + vdz*vdz
-                                local tstar = t0
-                                if vv > 0.000001 then
-                                    tstar = -((pdx*vdx + pdz*vdz) / vv)
-                                end
-                                if tstar < t0 then tstar = t0 elseif tstar > t1 then tstar = t1 end
-                                local sx = pdx + vdx*tstar
-                                local sy = pdy + vdy*tstar
-                                local sz = pdz + vdz*tstar
-                                local dmin = math.sqrt(sx*sx + sz*sz)
-
-                                local reach = (AP.Reach > 0) and AP.Reach or measureReach(e)
-                                -- Facing is a CONFIDENCE term, not a hard gate. The damage volume is
-                                -- an arc swept around the body, and in ODM the HRP look direction is
-                                -- a physics/animation artefact, not an aim vector — so a hard cone
-                                -- would be trivially beaten by a lateral fly-by, which is the single
-                                -- most common way anyone engages. Facing away just means you must be
-                                -- closer to trigger.
-                                local conf = 1
-                                pcall(function()
-                                    local lv = e.hrp.CFrame.LookVector
-                                    local ux, uz = -sx, -sz
-                                    local ul = math.sqrt(ux*ux + uz*uz)
-                                    if ul > 0.001 then
-                                        local d = (lv.X*(ux/ul) + lv.Z*(uz/ul))
-                                        conf = 0.55 + 0.45 * math.max(0, d)
+                        if sid and tptr then
+                            local key = e.name .. ":" .. tostring(tptr) .. ":" .. sid
+                            if not AP.Fired[key] then
+                                -- Only now is it worth resolving their blade tips (one-off ~6.5ms,
+                                -- deliberately off the commit path).
+                                local tips = resolveTips(e)
+                                for ti = 1, #tips do
+                                    local tip = tips[ti]
+                                    local tpos
+                                    pcall(function() tpos = tip.Position end)
+                                    if tpos then
+                                        -- index, NOT tostring(tip): tostring on a shim yields the
+                                        -- part's Name, and both blade tips are often named the same.
+                                        local ckey = key .. ":" .. ti
+                                        local rec = AP.Cand[ckey] or {}
+                                        -- Differentiate the tip: this reproduces the game's own ray
+                                        -- (origin = tip now, direction = tip movement this frame).
+                                        local vx, vy, vz = 0, 0, 0
+                                        local dt = now - (rec.t or 0)
+                                        if rec.x and dt > 0.001 and dt < 0.25 then
+                                            vx = (tpos.X - rec.x) / dt
+                                            vy = (tpos.Y - rec.y) / dt
+                                            vz = (tpos.Z - rec.z) / dt
+                                            -- the swept segment the game would raycast right now
+                                            local sd = segDist(myPos.X, myPos.Y, myPos.Z,
+                                                rec.x, rec.y, rec.z, tpos.X, tpos.Y, tpos.Z)
+                                            -- and where that tip is heading relative to me
+                                            local rx = vx - myVel.X
+                                            local ry = vy - myVel.Y
+                                            local rz = vz - myVel.Z
+                                            local pd, pt = closest(tpos.X - myPos.X, tpos.Y - myPos.Y, tpos.Z - myPos.Z,
+                                                rx, ry, rz, 0.45)
+                                            local thresh = AP.BodyR
+                                            if sd <= thresh then
+                                                if 0 < bestT then bestT = 0; bestE = e; bestD = sd; bestK = key end
+                                            elseif pd <= thresh and pt < bestT then
+                                                bestT = pt; bestE = e; bestD = pd; bestK = key
+                                            end
+                                        end
+                                        rec.x, rec.y, rec.z, rec.t = tpos.X, tpos.Y, tpos.Z, now
+                                        AP.Cand[ckey] = rec
                                     end
-                                end)
-                                local thresh = (reach + AP.Pad) * conf
-                                local vertOk = math.abs(sy) <= AP.VertReach
-
-                                if dmin <= thresh and vertOk then
-                                    -- Rank and commit on the PREDICTED CONTACT instant (tstar), not
-                                    -- on the damage frame. For a grapple-in that is when they
-                                    -- actually arrive, which can be several hundred ms after the
-                                    -- blade went live. Committing on tti fired far too early and
-                                    -- burned the 5s lockout before they were ever in range.
-                                    if tstar < bestTTI then bestTTI = tstar; bestCand = c end
-                                else
-                                    AP.Rejected = AP.Rejected + 1
-                                    AP.Status = string.format("bait ignored  %s  d=%.0f>%.0f", e.name, dmin, thresh)
                                 end
                             end
                         end
                     end
                 end
             end
+            AP.Near = near
 
-            -- prune finished/vanished candidates (string keys only — never shims)
-            for k in pairs(AP.Cand) do
-                if not seen[k] then AP.Cand[k] = nil end
-            end
-
-            -- COMMIT at the last responsible moment — ~120ms before PREDICTED CONTACT (bestTTI is
-            -- now the arrival instant, not the damage frame). This is what keeps it bait-proof:
-            -- a swing thrown from range only commits once the attacker has actually closed, so
-            -- someone who swings and then veers off never gets a press out of us.
-            if bestCand and not blocked then
-                local commit = AP.Lead + 0.07
-                if bestTTI <= commit then
-                    firePress()
-                    AP.Status = "PARRY  " .. tostring(bestCand.name)
-                    AP.Cand = {}
-                end
-            elseif bestCand and blocked then
-                AP.Status = "threat seen (locked out)"
-            elseif AP.Status == "" or AP.Status == "off" then
+            -- COMMIT. bestT is seconds until their blade sweep reaches my body. Press just before
+            -- it lands; one press per swing track, and never faster than 0.3s apart.
+            if bestE and not blocked and bestT <= 0.12 and (now - AP.LastPress) > 0.3 then
+                if AP.CoolUntil and now < AP.CoolUntil then AP.ProbeAt = now end
+                press()
+                -- one press per swing track: without this the commit predicate stays true for many
+                -- consecutive ticks and a single swing turns into a burst of presses
+                if bestK then AP.Fired[bestK] = true end
+                AP.Status = string.format("PARRY %s  d=%.1f", bestE.name, bestD)
+            elseif bestE then
+                AP.Status = string.format("tracking %s  t=%.2f d=%.1f", bestE.name, bestT, bestD)
+            elseif AP.CoolUntil and now < AP.CoolUntil then
+                AP.Status = string.format("cooldown %.1fs", AP.CoolUntil - now)
+            else
                 AP.Status = "armed"
             end
+
+            -- prune per-swing memory
+            if now - (AP.PruneAt or 0) > 3 then
+                AP.PruneAt = now
+                AP.Cand = {}
+                AP.Fired = {}
+            end
         end)
-        if not ok then AP.Status = "error (retrying)" end
-        task.wait(1/120)
+        if not ok then
+            AP.Err = AP.Err + 1
+            AP.Status = "error"
+            -- never leave the key down if the tick died between press and release
+            pcall(keyrelease, AP.Key)
+            AP.Armed = 0
+        end
+        task.wait(1 / 120)
     end
+    pcall(keyrelease, AP.Key)
+end)
+
+-- enemy parry-cooldown draw loop (own slow thread: text only needs ~15Hz)
+task.spawn(function()
+    while GUI.Running and AP.Gen == myGen do
+        pcall(function()
+            local used = 0
+            if AP.On and AP.ESP then
+                local now = os.clock()
+                for _, e in ipairs(AP.Roster) do
+                    if e.parryAt and e.parryAt > 0 then
+                        local left = (e.parryAt + AP.CD) - now
+                        if left > 0 then
+                            local pos
+                            pcall(function() pos = e.hrp.Position end)
+                            if pos then
+                                local v2, on = WorldToScreen(pos + Vector3.new(0, 4, 0))
+                                if v2 and on then
+                                    used = used + 1
+                                    local d = espText(used)
+                                    if d then
+                                        d.Text = string.format("PARRY %.1fs", left)
+                                        d.Position = Vector2.new(v2.X, v2.Y)
+                                        d.Visible = true
+                                    end
+                                end
+                            end
+                        else
+                            e.parryAt = 0
+                        end
+                    end
+                end
+            end
+            for i = used + 1, #ESPPool do ESPPool[i].Visible = false end
+        end)
+        task.wait(1 / 15)
+    end
+    for _, d in ipairs(ESPPool) do pcall(function() d:Remove() end) end
 end)
 
 end)()
@@ -7556,84 +7582,61 @@ end)()
 
         local KEYS = { "F", "Q", "E", "R", "C", "V", "X", "Z", "T", "G", "B", "H" }
         local KEYVK = { F=0x46, Q=0x51, E=0x45, R=0x52, C=0x43, V=0x56, X=0x58, Z=0x5A, T=0x54, G=0x47, B=0x42, H=0x48 }
-        local function vkName(vk) for n, v in pairs(KEYVK) do if v == vk then return n end end return "F" end
+        local function vkName(vk) for n, v in pairs(KEYVK) do if v == vk then return n end end return "?" end
 
-        local secMain = tab:Section("Parry", "Left", "Only fires when a hit would actually land")
-        secMain:Toggle("Auto Parry", AP.On, function(v)
-            AP.On = v
-            AP.Status = v and "armed" or "off"
-        end):Tooltip("predicts where both of you will be when the blade goes live, and only then presses")
+        local secMain = tab:Section("Parry", "Left", "Watches the blade, not a radius")
+        secMain:Toggle("Auto Parry", AP.On, function(v) AP.On = v end)
+            :Tooltip("presses only when their blade sweep is about to reach your body")
         secMain:Dropdown("Parry Key", vkName(AP.Key), KEYS, false, function(v)
             AP.Key = KEYVK[ddVal(v)] or 0x46
         end):Tooltip("must match your in-game 'Blade Parry' keybind (default F)")
-        secMain:Toggle("Guard Melee Tools", AP.Melee, function(v) AP.Melee = v end)
-            :Tooltip("also react to Sabre / Knife swings — that system uses F as a HELD block, so only enable with a melee tool out")
-        secMain:Toggle("Respect 5s Lockout", AP.Respect, function(v) AP.Respect = v end)
-            :Tooltip("a whiffed parry locks you out for 5s (game constant) — keep this on")
-
-        local secTune = tab:Section("Accuracy", "Left", "Lower = stricter, harder to bait")
-        secTune:Slider("Safety Margin", math.floor(AP.Pad * 10), 1, 0, 60, "", function(v)
-            AP.Pad = (tonumber(v) or 20) / 10
-        end):Tooltip("studs added to the measured blade reach (x0.1). Raise if you get clipped, lower if baited")
-        secTune:Slider("Reach Override", math.floor(AP.Reach), 1, 0, 40, " studs", function(v)
-            AP.Reach = tonumber(v) or 0
-        end):Tooltip("0 = measure each attacker's real blade length live (recommended)")
-        secTune:Slider("Damage Frame", math.floor(AP.Tdmg * 1000), 5, 100, 700, " ms", function(v)
-            AP.Tdmg = (tonumber(v) or 300) / 1000
-        end):Tooltip("how far into the swing animation the blade goes live. Raise if you parry too early")
-        secTune:Slider("Blade Linger", math.floor(AP.Window * 1000), 25, 100, 2000, " ms", function(v)
-            AP.Window = (tonumber(v) or 450) / 1000
-        end):Tooltip("how long the blade keeps hitting after it goes live. RAISE THIS if people slash from far, grapple in, and clip you on arrival")
-        secTune:Slider("Vertical Reach", math.floor(AP.VertReach), 1, 3, 40, " studs", function(v)
-            AP.VertReach = tonumber(v) or 9
-        end):Tooltip("ignore attackers this far above/below you (stops parrying someone slashing a titan overhead)")
-        secTune:Slider("Watch Radius", math.floor(AP.Watch), 5, 20, 200, " studs", function(v)
-            AP.Watch = tonumber(v) or 60
-        end):Tooltip("nothing beyond this is even examined — pure CPU saving, not the trigger range")
+        secMain:Dropdown("Toggle Hotkey", vkName(AP.ToggleKey), KEYS, false, function(v)
+            AP.ToggleKey = KEYVK[ddVal(v)] or 0x47
+        end):Tooltip("tap to turn Auto Parry on/off without opening the menu")
+        secMain:Toggle("Enemy Parry Cooldown", AP.ESP, function(v) AP.ESP = v end)
+            :Tooltip("draws the lockout timer over anyone who just parried — they cannot defend while it runs")
 
         local secInfo = tab:Section("Status", "Right", "Live")
         pcall(function()
             secInfo:Label(function()
-                if not AP.On then return "Auto Parry:  OFF" end
-                return string.format("Auto Parry:  ON   (%s)", vkName(AP.Key))
+                if not AP.On then return "Auto Parry:  OFF   (" .. vkName(AP.ToggleKey) .. " to arm)" end
+                return "Auto Parry:  ON   parry=" .. vkName(AP.Key)
             end)
         end)
         pcall(function() secInfo:Label(function() return "State:  " .. tostring(AP.Status or "-") end) end)
         pcall(function()
             secInfo:Label(function()
-                local now = os.clock()
-                if now < (AP.RefractoryUntil or 0) then
-                    return string.format("Lockout:  %.1fs remaining", AP.RefractoryUntil - now)
-                end
-                return "Lockout:  ready"
+                return string.format("Presses %d   registered %d", AP.Presses or 0, AP.Registered or 0)
             end)
         end)
         pcall(function()
             secInfo:Label(function()
-                return string.format("Parried %d   confirmed %d   baits ignored %d",
-                    AP.Fired or 0, AP.Confirmed or 0, AP.Rejected or 0)
+                return string.format("Learned cooldown:  %.1fs", AP.CD or 5)
             end)
         end)
         pcall(function()
             secInfo:Label(function()
                 local hz = math.floor((AP.Hz or 0) + 0.5)
-                return string.format("Loop:  %d Hz   tracking %d", hz, #(AP.Roster or {}))
+                return string.format("Loop %d Hz   tracking %d   errors %d", hz, AP.Near or 0, AP.Err or 0)
             end)
         end)
-        secInfo:Button("Reset Counters", function()
-            AP.Fired, AP.Confirmed, AP.Rejected, AP.Baited = 0, 0, 0, 0
-            AP.RefractoryUntil = 0
-            uiNotify("Auto Parry", "counters cleared", 2)
+        secInfo:Button("Reset Learned Values", function()
+            AP.CD = 5.0
+            AP.LastReg = nil
+            AP.CoolUntil = nil
+            AP.Presses, AP.Registered, AP.Err = 0, 0, 0
+            uiNotify("Auto Parry", "relearning", 2)
         end)
 
-        local secHelp = tab:Section("How It Works", "Right", "Why it can't be baited")
-        pcall(function() secHelp:Label(function() return "Solves where you BOTH will be at the" end) end)
-        pcall(function() secHelp:Label(function() return "instant the blade goes live, then needs" end) end)
-        pcall(function() secHelp:Label(function() return "that gap inside the real blade reach" end) end)
-        pcall(function() secHelp:Label(function() return "(measured live, ~6-11 studs)." end) end)
-        pcall(function() secHelp:Label(function() return "Presses ~120ms before impact, so a" end) end)
-        pcall(function() secHelp:Label(function() return "feint must cancel inside 120ms to fool it." end) end)
-        pcall(function() secHelp:Label(function() return "Held charges never commit." end) end)
+        local secWhy = tab:Section("No Sliders", "Left", "Why there is nothing to tune")
+        pcall(function() secWhy:Label(function() return "The game hits you by raycasting each" end) end)
+        pcall(function() secWhy:Label(function() return "blade point along the distance it moved" end) end)
+        pcall(function() secWhy:Label(function() return "that frame. So this watches their actual" end) end)
+        pcall(function() secWhy:Label(function() return "blade and tests the same segment." end) end)
+        pcall(function() secWhy:Label(function() return "Reach, damage frame and linger are all" end) end)
+        pcall(function() secWhy:Label(function() return "measured, so there is nothing to guess." end) end)
+        pcall(function() secWhy:Label(function() return "Whiffing costs 5s, so it stays quiet" end) end)
+        pcall(function() secWhy:Label(function() return "unless contact is actually predicted." end) end)
     end)
     -- ===== Tab: Logs =====
     tabBuild(function()
