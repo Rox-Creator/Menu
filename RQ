@@ -6187,7 +6187,9 @@ local AP = {
     VertReach     = 9.0,
     Watch         = 60,     -- studs: nothing further than this is even animator-walked
     Tdmg          = 0.30,   -- animation-time of the damage frame (melee analogue; tunable)
-    Window        = 0.25,   -- how long the blade stays live
+    Window        = 0.45,   -- blade linger: how long the hitbox keeps sweeping after it goes live.
+                            -- This is the knob for "he slashed from far and it hit me when he
+                            -- arrived" — it sets how far ahead we keep looking for their arrival.
     Lead          = 0.05,   -- extra safety added to the commit deadline
     Cone          = 0.35,   -- facing CONFIDENCE floor (not a hard gate — see below)
     Respect       = true,   -- honour the 5s whiff lockout
@@ -6499,7 +6501,8 @@ task.spawn(function()
 
                             local rate = c.rate or 1
                             if rate < 0.3 then rate = 1 end  -- don't let a stall inflate TTI
-                            local tti = (AP.Tdmg - tp) / rate
+                            local tti  = (AP.Tdmg - tp) / rate   -- when the blade goes LIVE
+                            local tEnd = tti + AP.Window         -- when it can no longer hurt
 
                             if c.stalled then
                                 -- onHoldBasicBladeSwing freezes the track at the "Freeze" keyframe,
@@ -6507,19 +6510,23 @@ task.spawn(function()
                                 -- dancing in and out of reach. Never commit to a frozen track —
                                 -- this is the strongest bait in the game.
                                 AP.Status = "watching (charge held)"
-                            elseif tti < 0.60 and tti > -0.25 then
-                                -- Note the negative floor rather than dropping at tti<0: the blade
-                                -- stays live for Window seconds, so a slightly late press still
-                                -- lands inside the guard. Dropping would guarantee the hit.
+                            elseif tEnd > -0.05 and tti < 2.0 then
+                                -- BLADE LINGER. The hitbox is a raycast sweep that stays live for
+                                -- AP.Window, so an attacker can start a swing 40 studs out, grapple
+                                -- in, and connect on ARRIVAL — long after the damage frame. The old
+                                -- bound here (tti < 0.60 and tti > -0.25) threw that candidate away
+                                -- before they arrived, so the hit landed unparried and got counted
+                                -- as a "bait ignored". We now keep watching for the whole time the
+                                -- blade can still reach us.
                                 evel = evel or Vector3.new(0,0,0)
-                                -- Closest approach over the damage window.
                                 local pdx, pdy, pdz = dx, dy, dz
                                 local vdx = evel.X - myVel.X
                                 local vdy = evel.Y - myVel.Y
                                 local vdz = evel.Z - myVel.Z
                                 local t0 = tti
-                                local t1 = tti + AP.Window
+                                local t1 = tEnd
                                 if t0 < 0 then t0 = 0 end
+                                if t1 < t0 then t1 = t0 end
                                 local vv = vdx*vdx + vdz*vdz
                                 local tstar = t0
                                 if vv > 0.000001 then
@@ -6552,7 +6559,12 @@ task.spawn(function()
                                 local vertOk = math.abs(sy) <= AP.VertReach
 
                                 if dmin <= thresh and vertOk then
-                                    if tti < bestTTI then bestTTI = tti; bestCand = c end
+                                    -- Rank and commit on the PREDICTED CONTACT instant (tstar), not
+                                    -- on the damage frame. For a grapple-in that is when they
+                                    -- actually arrive, which can be several hundred ms after the
+                                    -- blade went live. Committing on tti fired far too early and
+                                    -- burned the 5s lockout before they were ever in range.
+                                    if tstar < bestTTI then bestTTI = tstar; bestCand = c end
                                 else
                                     AP.Rejected = AP.Rejected + 1
                                     AP.Status = string.format("bait ignored  %s  d=%.0f>%.0f", e.name, dmin, thresh)
@@ -6568,7 +6580,10 @@ task.spawn(function()
                 if not seen[k] then AP.Cand[k] = nil end
             end
 
-            -- COMMIT at the last responsible moment.
+            -- COMMIT at the last responsible moment — ~120ms before PREDICTED CONTACT (bestTTI is
+            -- now the arrival instant, not the damage frame). This is what keeps it bait-proof:
+            -- a swing thrown from range only commits once the attacker has actually closed, so
+            -- someone who swings and then veers off never gets a press out of us.
             if bestCand and not blocked then
                 local commit = AP.Lead + 0.07
                 if bestTTI <= commit then
@@ -7566,6 +7581,9 @@ end)()
         secTune:Slider("Damage Frame", math.floor(AP.Tdmg * 1000), 5, 100, 700, " ms", function(v)
             AP.Tdmg = (tonumber(v) or 300) / 1000
         end):Tooltip("how far into the swing animation the blade goes live. Raise if you parry too early")
+        secTune:Slider("Blade Linger", math.floor(AP.Window * 1000), 25, 100, 2000, " ms", function(v)
+            AP.Window = (tonumber(v) or 450) / 1000
+        end):Tooltip("how long the blade keeps hitting after it goes live. RAISE THIS if people slash from far, grapple in, and clip you on arrival")
         secTune:Slider("Vertical Reach", math.floor(AP.VertReach), 1, 3, 40, " studs", function(v)
             AP.VertReach = tonumber(v) or 9
         end):Tooltip("ignore attackers this far above/below you (stops parrying someone slashing a titan overhead)")
