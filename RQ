@@ -6216,6 +6216,17 @@ GUI.AP = AP
 -- outside the chunk and the feature cannot be inspected live while debugging.
 pcall(function() rawset(_G, "RQAP", AP) end)
 
+-- The UI library's Keybind control hands back a lowercase key NAME ("f", "g", "f4"), while
+-- iskeypressed/keypress want a Win32 virtual-key code. Invert the menu's own VK_NAMES so the two
+-- always agree, and expose it so the tab can convert without duplicating the table.
+local NAME2VK = {}
+for vk, n in pairs(VK_NAMES) do NAME2VK[string.lower(n)] = vk end
+GUI.VKFromName = function(n)
+    if type(n) ~= "string" then return nil end
+    return NAME2VK[string.lower(n)]
+end
+GUI.VKToName = function(vk) return string.lower(VK_NAMES[vk] or "f") end
+
 local function rptr(a) local ok, v = pcall(memory_read, "uintptr", a) return ok and v or nil end
 local function rflt(a) local ok, v = pcall(memory_read, "float", a) return ok and v or nil end
 local function ri32(a) local ok, v = pcall(memory_read, "int32", a) return ok and v or nil end
@@ -6481,6 +6492,110 @@ end
 AP.Gen = (AP.Gen or 0) + 1
 local myGen = AP.Gen
 
+-- ============================================================
+-- FAST SWING  —  local playback speed on your OWN swing animations
+-- ============================================================
+-- Writes AnimationTrack.Speed (+212) on your own swing tracks. Entirely local: it changes how fast
+-- YOUR client plays the animation. Nothing is sent to the server, no remote is touched.
+--   tap / release : play the slash at Swing Speed, then zoom the recovery tail at Recovery Speed so
+--                   you become actionable again sooner
+--   M1 held       : boost only the windup for a short, auto-sized window and then go COMPLETELY
+--                   hands-off, so the game parks the charge at that animation's own keyframe.
+--                   Guessing a fixed freeze point does not work — combo animations freeze at
+--                   different places, which is what made earlier versions slip on rapid re-swings.
+local FS = {
+    On = false,
+    Key = 0x48,        -- H
+    Swing = 1.0,       -- playback rate for the active slash / windup boost
+    Recovery = 8.0,    -- playback rate for the recovery tail
+    Windup = 0.36,     -- how much of the animation the charge boost covers before hands-off
+    Slash = 0.35,      -- animation time that still counts as the slash rather than the tail
+    M1 = false, M1At = 0, Phase = "-", Hz = 0,
+}
+GUI.FS = FS
+pcall(function() rawset(_G, "RQFS", FS) end)
+
+-- Melee tool swings are included as well: this is purely local playback speed, so it helps every
+-- weapon, not just the gear blades the parry cares about.
+local FS_SWINGS = {}
+for id in pairs(SWINGS) do FS_SWINGS[id] = true end
+for _, id in ipairs({ "112666168396669", "86140055867484", "124361532701064", "136621055776523",
+                      "82666636655771", "75659520618730", "89635808450635" }) do FS_SWINGS[id] = true end
+
+local function fsApply(now)
+    local ch = LP.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local an = hum and hum:FindFirstChildOfClass("Animator")
+    if not an then return end
+    local okA, A = pcall(function() return tonumber(an.Address) end)
+    if not (okA and A) then return end
+    local head = rptr(A + OA)
+    if not head or head < 0x10000 then return end
+    local node, guard = rptr(head + ON), 0
+    -- Visit EVERY matching track, not just the first: a combo can have two swing tracks blended.
+    while node and node > 0x10000 and node ~= head and guard < 64 do
+        guard = guard + 1
+        local t = rptr(node + OT)
+        if t and t > 0x10000 and rptr(t + OO) == A then
+            local id = trackId(t)
+            if id and FS_SWINGS[id] then
+                local tp = rflt(t + OP) or 0
+                if FS.M1 then
+                    local boostFor = FS.Windup / math.max(1, FS.Swing)
+                    if (now - FS.M1At) < boostFor then
+                        pcall(memory_write, "float", t + OS, FS.Swing)
+                        FS.Phase = "charge boost"
+                    else
+                        FS.Phase = "held (hands off)"
+                    end
+                elseif tp < FS.Slash then
+                    pcall(memory_write, "float", t + OS, FS.Swing)
+                    FS.Phase = "slash"
+                else
+                    pcall(memory_write, "float", t + OS, FS.Recovery)
+                    FS.Phase = "recovery zoom"
+                end
+            end
+        end
+        node = rptr(node + ON)
+    end
+end
+
+task.spawn(function()
+    local wasK, ready = false, false
+    local hzN, hzT = 0, os.clock()
+    while GUI.Running and AP.Gen == myGen do
+        pcall(function()
+            local now = os.clock()
+            hzN = hzN + 1
+            if now - hzT >= 1 then FS.Hz = hzN / (now - hzT); hzN, hzT = 0, now end
+
+            -- M1 edge, read here rather than on its own thread: ismouse1pressed is executor-local
+            -- and effectively free, so it costs nothing to sample it in the same loop.
+            local m1 = false
+            pcall(function() m1 = ismouse1pressed() and true or false end)
+            if m1 and not FS.M1 then FS.M1At = now end
+            FS.M1 = m1
+
+            -- hotkey, with the same release-arm guard the parry uses
+            local d = false
+            pcall(function() d = iskeypressed(FS.Key) and true or false end)
+            if not ready then
+                if not d then ready = true end
+            elseif d and not wasK then
+                FS.On = not FS.On
+                pcall(function() if GUI._uiFS then GUI._uiFS:Set(FS.On) end end)
+                pcall(function() uiNotify("Fast Swing", FS.On and "ON" or "OFF", 2) end)
+            end
+            wasK = d
+
+            if FS.On then fsApply(now) end
+            if not FS.On then FS.Phase = "-" end
+        end)
+        task.wait(FS.On and 1 / 200 or 1 / 30)
+    end
+end)
+
 task.spawn(function()
     local hzN, hzT = 0, os.clock()
     local wasToggle, toggleReady = false, false
@@ -6507,6 +6622,9 @@ task.spawn(function()
                 if not td then toggleReady = true end
             elseif td and not wasToggle then
                 AP.On = not AP.On
+                -- Push the new state back into the checkbox, or the hotkey flips the feature while
+                -- the switch sits there still showing the old position.
+                pcall(function() if GUI._uiAP then GUI._uiAP:Set(AP.On) end end)
                 pcall(function() uiNotify("Auto Parry", AP.On and "ON" or "OFF", 2) end)
             end
             wasToggle = td
@@ -7824,35 +7942,75 @@ end)()
     tabBuild(function()
         local tab = window:Tab("Auto Parry", "shield")
         local AP = GUI.AP
+        local FS = GUI.FS
         if not AP then return end
-
-        local KEYS = { "F", "Q", "E", "R", "C", "V", "X", "Z", "T", "G", "B", "H" }
-        local KEYVK = { F=0x46, Q=0x51, E=0x45, R=0x52, C=0x43, V=0x56, X=0x58, Z=0x5A, T=0x54, G=0x47, B=0x42, H=0x48 }
-        local function vkName(vk) for n, v in pairs(KEYVK) do if v == vk then return n end end return "?" end
+        local toName = GUI.VKToName or function(v) return "f" end
+        local toVK = GUI.VKFromName or function(_) return nil end
 
         local secMain = tab:Section("Parry", "Left", "Watches the blade, not a radius")
-        secMain:Toggle("Auto Parry", AP.On, function(v) AP.On = v end)
-            :Tooltip("presses only when their blade sweep is about to reach your body")
-        secMain:Dropdown("Parry Key", vkName(AP.Key), KEYS, false, function(v)
-            AP.Key = KEYVK[ddVal(v)] or 0x46
-        end):Tooltip("must match your in-game 'Blade Parry' keybind (default F)")
-        secMain:Dropdown("Toggle Hotkey", vkName(AP.ToggleKey), KEYS, false, function(v)
-            AP.ToggleKey = KEYVK[ddVal(v)] or 0x47
-        end):Tooltip("tap to turn Auto Parry on/off without opening the menu")
+
+        -- Stored so the hotkey handler can push state back into the checkbox — otherwise the key
+        -- flips the feature while the switch keeps showing the old position.
+        GUI._uiAP = secMain:Toggle("Auto Parry", AP.On, function(v) AP.On = v end)
+        pcall(function() GUI._uiAP:Tooltip("presses only when their blade sweep is about to reach your body") end)
+
+        -- Click-to-capture keybinds rather than dropdowns, so ANY key can be bound.
+        -- Individually pcall'd: :Keybind exists in the forked lib but not necessarily in the
+        -- upstream fallback, and tabBuild would otherwise drop the entire tab on a missing method.
+        pcall(function()
+            secMain:Keybind("Parry Key", toName(AP.Key), function(k)
+                local vk = toVK(k)
+                if vk then AP.Key = vk end
+            end, "click, then press the key that matches your in-game 'Blade Parry' bind")
+        end)
+        pcall(function()
+            secMain:Keybind("Toggle Hotkey", toName(AP.ToggleKey), function(k)
+                local vk = toVK(k)
+                if vk then AP.ToggleKey = vk end
+            end, "click, then press any key to arm/disarm Auto Parry without opening the menu")
+        end)
+
         secMain:Toggle("Enemy Parry Cooldown", AP.ESP, function(v) AP.ESP = v end)
-            :Tooltip("draws the lockout timer over anyone who just parried — they cannot defend while it runs")
-        -- Not a tuning knob: Matcha cannot read ping by ANY route (GetNetworkPing, Stats:GetValue,
-        -- GetServerTimeNow are all missing methods), so this is the one number the script cannot
-        -- obtain for itself. Set it to your real ping and it compensates both halves automatically.
-        secMain:Slider("Your Ping", math.floor(AP.PingMs or 200), 5, 0, 400, " ms", function(v)
-            AP.PingMs = tonumber(v) or 200
-        end):Tooltip("your ACTUAL round-trip ping. Half is used to un-stale what you see of them, half to lead the press")
+
+        -- Ping stays a typed value, not a slider: Matcha cannot read it (GetNetworkPing,
+        -- Stats:GetValue and GetServerTimeNow are all missing methods), so it is the one number the
+        -- script genuinely cannot measure for itself. Half un-stales what you see of the enemy,
+        -- half leads the press.
+        secMain:Textbox("Your Ping (ms)", tostring(math.floor(AP.PingMs or 200)), function(s)
+            local n = tonumber(s)
+            if n and n >= 0 and n <= 600 then AP.PingMs = n end
+        end, "your real round-trip ping")
+
+        pcall(function() secMain:Divider("Fast Swing") end)
+
+        if FS then
+            GUI._uiFS = secMain:Toggle("Fast Swing", FS.On, function(v) FS.On = v end)
+            pcall(function() GUI._uiFS:Tooltip("speeds up your own swing animation and skips the recovery tail (local only)") end)
+            pcall(function()
+                secMain:Keybind("Fast Swing Key", toName(FS.Key), function(k)
+                    local vk = toVK(k)
+                    if vk then FS.Key = vk end
+                end, "click, then press any key to toggle Fast Swing")
+            end)
+            secMain:Textbox("Swing Speed", tostring(FS.Swing), function(s)
+                local n = tonumber(s)
+                if n and n > 0 and n <= 20 then FS.Swing = n end
+            end, "playback rate of the slash itself. 1.0 = unchanged")
+            secMain:Textbox("Recovery Speed", tostring(FS.Recovery), function(s)
+                local n = tonumber(s)
+                if n and n > 0 and n <= 30 then FS.Recovery = n end
+            end, "how fast the recovery tail is skipped — this is what makes you actionable sooner")
+            secMain:Textbox("Charge Windup", tostring(FS.Windup), function(s)
+                local n = tonumber(s)
+                if n and n > 0 and n <= 2 then FS.Windup = n end
+            end, "how much of the animation the charge boost covers before going hands-off")
+        end
 
         local secInfo = tab:Section("Status", "Right", "Live")
         pcall(function()
             secInfo:Label(function()
-                if not AP.On then return "Auto Parry:  OFF   (" .. vkName(AP.ToggleKey) .. " to arm)" end
-                return "Auto Parry:  ON   parry=" .. vkName(AP.Key)
+                if not AP.On then return "Auto Parry:  OFF   (" .. toName(AP.ToggleKey) .. ")" end
+                return "Auto Parry:  ON   parry=" .. toName(AP.Key)
             end)
         end)
         pcall(function() secInfo:Label(function() return "State:  " .. tostring(AP.Status or "-") end) end)
@@ -7863,14 +8021,15 @@ end)()
         end)
         pcall(function()
             secInfo:Label(function()
-                return string.format("Learned cooldown:  %.1fs", AP.CD or 5)
+                local hz = math.floor((AP.Hz or 0) + 0.5)
+                return string.format("Loop %d Hz   lead %.0fms   near %d", hz, (AP.Lead or 0) * 1000, AP.Near or 0)
             end)
         end)
         pcall(function()
             secInfo:Label(function()
-                local hz = math.floor((AP.Hz or 0) + 0.5)
-                return string.format("Loop %d Hz   lead %.0fms   near %d   err %d",
-                    hz, (AP.Lead or 0) * 1000, AP.Near or 0, AP.Err or 0)
+                if not FS then return "Fast Swing:  unavailable" end
+                if not FS.On then return "Fast Swing:  OFF   (" .. toName(FS.Key) .. ")" end
+                return string.format("Fast Swing:  %s   %s", FS.M1 and "M1 HELD" or "idle", tostring(FS.Phase or "-"))
             end)
         end)
         secInfo:Button("Reset Learned Values", function()
@@ -7880,16 +8039,6 @@ end)()
             AP.Presses, AP.Registered, AP.Err = 0, 0, 0
             uiNotify("Auto Parry", "relearning", 2)
         end)
-
-        local secWhy = tab:Section("No Sliders", "Left", "Why there is nothing to tune")
-        pcall(function() secWhy:Label(function() return "The game hits you by raycasting each" end) end)
-        pcall(function() secWhy:Label(function() return "blade point along the distance it moved" end) end)
-        pcall(function() secWhy:Label(function() return "that frame. So this watches their actual" end) end)
-        pcall(function() secWhy:Label(function() return "blade and tests the same segment." end) end)
-        pcall(function() secWhy:Label(function() return "Reach, damage frame and linger are all" end) end)
-        pcall(function() secWhy:Label(function() return "measured, so there is nothing to guess." end) end)
-        pcall(function() secWhy:Label(function() return "Whiffing costs 5s, so it stays quiet" end) end)
-        pcall(function() secWhy:Label(function() return "unless contact is actually predicted." end) end)
     end)
     -- ===== Tab: Logs =====
     tabBuild(function()
