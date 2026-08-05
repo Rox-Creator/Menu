@@ -6969,7 +6969,7 @@ task.spawn(function()
     while GUI.Running and AP.Gen == myGen do
         pcall(function()
             local used = 0
-            if AP.On and AP.ESP then
+            if AP.Enabled and AP.On and AP.ESP then
                 local now = os.clock()
                 for _, e in ipairs(AP.Roster) do
                     if e.parryAt and e.parryAt > 0 then
@@ -7965,7 +7965,9 @@ end)()
         -- moving the pill. Arming starts it running so it is usable immediately.
         GUI._uiAP = secMain:Toggle("Auto Parry", AP.Enabled, function(v)
             AP.Enabled = v
-            AP.On = v
+            -- Arming does NOT start it. The pill only permits the hotkey to work; the hotkey is
+            -- the thing that actually turns parrying on and off.
+            AP.On = false
         end)
         pcall(function() GUI._uiAP:Tooltip("arms Auto Parry. Once armed, the hotkey toggles it on/off without moving this switch") end)
 
@@ -7994,7 +7996,8 @@ end)()
 
             GUI._uiFS = secFS:Toggle("Fast Swing", FS.Enabled, function(v)
                 FS.Enabled = v
-                FS.On = v
+                -- same rule: the pill only permits the hotkey, it does not start the feature
+                FS.On = false
             end)
             pcall(function() GUI._uiFS:Tooltip("arms Fast Swing. Once armed, the hotkey toggles it on/off without moving this switch") end)
             pcall(function()
