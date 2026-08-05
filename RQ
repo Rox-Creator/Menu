@@ -21,10 +21,11 @@ local RS_SNAPSHOT_PATH = CONFIG_DIR .. "/rs_snapshot.json"
 local GUI = {}
 -- ============================================================
 -- SCRIPT VERSION — bump this on EVERY published change.
--- Single source of truth: it renders as the badge beside the menu title, so there is exactly one
--- place to edit. Format vMAJOR.MINOR; minor for normal changes, major for a rework.
+-- Single source of truth: drawBadge() in the REQUIEM UI block renders it as a pill in the menu's
+-- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
+-- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.3"
+GUI.Version = "v2.4"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -6013,7 +6014,12 @@ local function drawCharLock()
     if type(gx) ~= "number" or type(gy) ~= "number" or type(gw) ~= "number" or type(gh) ~= "number" then return end
     if gw < 40 or gh < 40 then return end
     R.fade = 1; R.yoff = 0; R.clipTop = nil; R.clipBot = nil
-    local Z = 3000000   -- lib content uses ZIndex up to 2,049,999 (!) — must clear it to sit on top
+    -- The lib scales every ZIndex it draws by 10000, so its layers land in the millions. This
+    -- clears the tab content it needs to cover, but NOT the lib's own floating overlays —
+    -- tooltips (~3.33M), the spotlight palette (~4.13M) and modal dialogs (~4.66M) still sit on
+    -- top, which is the behaviour you want from a dialog anyway. Left at 3000000 for that reason;
+    -- drawBadge deliberately goes higher because a version pill must never be occluded.
+    local Z = 3000000
     rect(gx, gy, gw, gh, C3(8, 8, 11), Z, 0.66, 6)                       -- scrim over ONLY the panel
     local pw = minf(380, gw - 36); local ph = 156
     local px = gx + (gw - pw) / 2; local py = gy + (gh - ph) / 2
@@ -6027,6 +6033,61 @@ local function drawCharLock()
     button("charlockload", px + (pw - 210) / 2, py + ph - 48, 210, 34, "Load Values  (~15s)", function()
         if GUI.CharLoad then GUI.CharLoad() end
     end, true, T.red, Z + 5)
+end
+
+-- Version badge, drawn by US rather than by the UI library.
+--
+-- The library was patched to render a `badge` option and it never once appeared, for two
+-- independent reasons — either alone is fatal:
+--   1. It funnels every ZIndex through a helper that multiplies it by 10000. The patch passed
+--      629997 (copied from a nearby RAW `.ZIndex=629999` assignment that bypasses that helper),
+--      so the pill asked for a ZIndex of ~6.3 BILLION — three times past int32, and dropped.
+--   2. Both of its alphas are multiplied by the sidebar hover spring, which is 0 whenever the
+--      sidebar is collapsed. The saved config has sidebarPinned=false, so that spring is 0 almost
+--      always — the window TITLE has the same bug and is invisible for the same reason.
+-- Drawing it here means we own the ZIndex, the alpha and the placement, and no future library
+-- push can silently break it again.
+--
+-- Placement: the 40px header band above the content rect, right-aligned, sharing the active tab
+-- title's optical centre line. (cx+cw) is the only stable horizontal anchor RQGeo gives us — it
+-- reduces to windowRight-18 whether the sidebar is collapsed or hover-expanded, whereas cx alone
+-- slides by the full sidebar width every time the cursor crosses the rail.
+-- Assumes the sidebar tab layout (the default, and what the saved config selects). Under
+-- Settings -> Tab layout -> Top the band belongs to the tab strip instead and this would sit on
+-- the tabs; RQGeo publishes nothing that distinguishes the two, so it is simply not supported.
+local vbGeo, vbIdle = nil, 0
+local function drawBadge()
+    local ver = tostring(GUI.Version or "")
+    if ver == "" then return end
+    local geo = _G.RQGeo
+    -- The library rebuilds RQGeo as a fresh table on every frame it renders the window, so table
+    -- IDENTITY is a free liveness signal. It matters because minimising to the bubble skips the
+    -- whole window renderer: RQGeo then freezes with open=true and a rect describing a window
+    -- that is no longer on screen, and anything trusting it paints a ghost over the game.
+    if geo ~= vbGeo then vbGeo = geo; vbIdle = 0 else vbIdle = vbIdle + R.dt end
+    local live = type(geo) == "table" and geo.open == true and vbIdle <= 0.25
+    -- open flips instantly but the window fades over ~200ms; ride the same curve so the badge
+    -- doesn't pop in ahead of the menu it belongs to.
+    local op = av("verbadge", live and 1 or 0, 12)
+    if op < 0.02 or type(geo) ~= "table" then return end
+    local cx, cy, cw, ch = geo.cx, geo.cy, geo.cw, geo.ch
+    if type(cx) ~= "number" or type(cy) ~= "number" or type(cw) ~= "number" or type(ch) ~= "number" then return end
+    if cw < 200 or ch < 40 then return end   -- half-initialised rect the lib can publish on frame one
+    -- All the draw fns share ONE pcall, so a panel that throws mid-draw leaves its fade and its
+    -- scissor band set for everyone after it. Reset all four or the badge silently clips to
+    -- nothing — and clipTop without clipBot is a hard error in rect().
+    R.fade = op; R.yoff = 0; R.clipTop = nil; R.clipBot = nil
+    local w = maxf(34, floor(tw(ver, 11)) + 18)
+    local x = cx + cw - w
+    local y = cy - 37   -- cy-48 is the top of the band; this centres an 18px pill on the tab title
+    -- 5,000,000 clears the library's real ceiling of 4,659,999 (its modal dialog's button labels,
+    -- base 455 through the x10000 helper). 3,000,000 — what drawCharLock above uses — does NOT:
+    -- tooltips, the spotlight palette and dialogs all outrank it.
+    local Z = 5000000
+    rect(x, y, w, 18, T.red, Z, 0.22, 6)
+    rect(x, y, w, 18, T.red, Z + 1, 0.60, 6, false, 1)     -- explicit thickness: pooled Squares keep the last one
+    txt(ver, x + w / 2, y + 3, 11, T.text, Z + 2, true)    -- label in T.text so a dark custom accent can't hide it
+    R.fade = 1
 end
 
 -- old Build*Panel are no longer renderers — the loop draws from GUI.*Open flags.
@@ -6071,6 +6132,9 @@ task.spawn(function()
         R._wasManip = manip
 
         beginFrame(); clicks={}; drags={}; scrolls={}; resizes={}
+        -- drawBadge FIRST and in its own pcall: the rest share one, so a player row or enchant
+        -- card that throws would otherwise blink the version out for that whole frame.
+        pcall(drawBadge)
         local ok,err=pcall(function() drawPlayers(); drawEnchants(); drawRS(); drawVelo(); drawCharLock() end)
         endFrame()
         if not ok then warn("[Requiem UI] "..tostring(err)) end
@@ -7114,10 +7178,11 @@ end)()
         title     = "Requiem",
         subtitle  = "Bro you don't go 290 velo",
         size      = Vector2.new(640, 580),
-        -- `badge` is now a REAL option: the forked lib had zero references to it, so it was being
-        -- silently ignored. Patched the fork (Rox-Creator/aaa-v uilib.lua) to store az.badge and
-        -- draw it as an accent pill at the top of the content area.
-        badge     = GUI.Version,
+        -- Deliberately NO `badge` here. The fork was patched to draw one and it could never work:
+        -- the lib scales every ZIndex by 10000 (so the patch's 629997 asked for 6,299,970,000, past
+        -- int32) and it multiplies the badge alpha by the sidebar hover spring, which sits at 0
+        -- while the sidebar is collapsed. GUI.Version is drawn by our own engine instead — see
+        -- drawBadge() in the REQUIEM UI block. Passing it here again would only risk a duplicate.
         menuKey   = "f3",        -- F3 toggles the menu (matches the old bind)
         gameInput = "always",    -- never eat movement keys
     })
