@@ -6179,7 +6179,9 @@ local PARRY_ONLY = { [ANIM_PARRY] = true }   -- hoisted: allocating this per tic
 
 local AP = {
     On = false,
-    Key = 0x46,          -- "Blade Parry" keybind (Gear slot 10 = F by default)
+    -- The in-game "Blade Parry" bind is always F (Gear keybind slot 10), so this is fixed rather
+    -- than exposed — there was nothing useful to change it to.
+    Key = 0x46,
     ToggleKey = 0x47,    -- G toggles the feature
     ESP = true,          -- enemy parry-cooldown readout
     -- learned, not configured
@@ -7944,7 +7946,7 @@ end)()
         local AP = GUI.AP
         local FS = GUI.FS
         if not AP then return end
-        local toName = GUI.VKToName or function(v) return "f" end
+        local toName = GUI.VKToName or function(_) return "f" end
         local toVK = GUI.VKFromName or function(_) return nil end
 
         local secMain = tab:Section("Parry", "Left", "Watches the blade, not a radius")
@@ -7954,15 +7956,9 @@ end)()
         GUI._uiAP = secMain:Toggle("Auto Parry", AP.On, function(v) AP.On = v end)
         pcall(function() GUI._uiAP:Tooltip("presses only when their blade sweep is about to reach your body") end)
 
-        -- Click-to-capture keybinds rather than dropdowns, so ANY key can be bound.
-        -- Individually pcall'd: :Keybind exists in the forked lib but not necessarily in the
-        -- upstream fallback, and tabBuild would otherwise drop the entire tab on a missing method.
-        pcall(function()
-            secMain:Keybind("Parry Key", toName(AP.Key), function(k)
-                local vk = toVK(k)
-                if vk then AP.Key = vk end
-            end, "click, then press the key that matches your in-game 'Blade Parry' bind")
-        end)
+        -- Click-to-capture rather than a dropdown, so ANY key can be bound. Individually pcall'd:
+        -- :Keybind exists in the forked lib but not necessarily in the upstream fallback, and
+        -- tabBuild would otherwise drop the entire tab on a missing method.
         pcall(function()
             secMain:Keybind("Toggle Hotkey", toName(AP.ToggleKey), function(k)
                 local vk = toVK(k)
@@ -7972,45 +7968,46 @@ end)()
 
         secMain:Toggle("Enemy Parry Cooldown", AP.ESP, function(v) AP.ESP = v end)
 
-        -- Ping stays a typed value, not a slider: Matcha cannot read it (GetNetworkPing,
-        -- Stats:GetValue and GetServerTimeNow are all missing methods), so it is the one number the
-        -- script genuinely cannot measure for itself. Half un-stales what you see of the enemy,
-        -- half leads the press.
-        secMain:Textbox("Your Ping (ms)", tostring(math.floor(AP.PingMs or 200)), function(s)
-            local n = tonumber(s)
-            if n and n >= 0 and n <= 600 then AP.PingMs = n end
-        end, "your real round-trip ping")
+        -- Ping is not a tuning knob — Matcha cannot read it (GetNetworkPing, Stats:GetValue and
+        -- GetServerTimeNow are all missing methods), so it is the one number the script cannot
+        -- measure for itself. Half un-stales what you see of the enemy, half leads the press.
+        secMain:Slider("Your Ping", math.floor(AP.PingMs or 200), 5, 0, 400, " ms", function(v)
+            AP.PingMs = tonumber(v) or 200
+        end):Tooltip("your real round-trip ping — set this to what Roblox reports")
 
-        pcall(function() secMain:Divider("Fast Swing") end)
-
+        -- ---- separate panel, below Auto Parry in the same column ----
         if FS then
-            GUI._uiFS = secMain:Toggle("Fast Swing", FS.On, function(v) FS.On = v end)
-            pcall(function() GUI._uiFS:Tooltip("speeds up your own swing animation and skips the recovery tail (local only)") end)
+            local secFS = tab:Section("Fast Swing", "Left", "Your own swing animation speed")
+
+            GUI._uiFS = secFS:Toggle("Fast Swing", FS.On, function(v) FS.On = v end)
+            pcall(function() GUI._uiFS:Tooltip("speeds up your swing and skips the recovery tail — local only, nothing is sent to the server") end)
             pcall(function()
-                secMain:Keybind("Fast Swing Key", toName(FS.Key), function(k)
+                secFS:Keybind("Fast Swing Key", toName(FS.Key), function(k)
                     local vk = toVK(k)
                     if vk then FS.Key = vk end
                 end, "click, then press any key to toggle Fast Swing")
             end)
-            secMain:Textbox("Swing Speed", tostring(FS.Swing), function(s)
-                local n = tonumber(s)
-                if n and n > 0 and n <= 20 then FS.Swing = n end
-            end, "playback rate of the slash itself. 1.0 = unchanged")
-            secMain:Textbox("Recovery Speed", tostring(FS.Recovery), function(s)
-                local n = tonumber(s)
-                if n and n > 0 and n <= 30 then FS.Recovery = n end
-            end, "how fast the recovery tail is skipped — this is what makes you actionable sooner")
-            secMain:Textbox("Charge Windup", tostring(FS.Windup), function(s)
-                local n = tonumber(s)
-                if n and n > 0 and n <= 2 then FS.Windup = n end
-            end, "how much of the animation the charge boost covers before going hands-off")
+            -- Fractional steps are supported: the library snaps to min + k*step and rounds to a
+            -- precision derived from the step, so 0.1 shows 1dp and 0.01 shows 2dp.
+            secFS:Slider("Swing Speed", FS.Swing, 0.1, 0.5, 10, "x", function(v)
+                FS.Swing = tonumber(v) or 1
+            end):Tooltip("playback rate of the slash itself. 1.0 = unchanged")
+            secFS:Slider("Recovery Speed", FS.Recovery, 0.5, 1, 30, "x", function(v)
+                FS.Recovery = tonumber(v) or 8
+            end):Tooltip("how fast the recovery tail is skipped — this is what makes you actionable again sooner")
+            secFS:Slider("Charge Windup", FS.Windup, 0.01, 0.05, 1.5, "", function(v)
+                FS.Windup = tonumber(v) or 0.36
+            end):Tooltip("how much of the animation the charge boost covers before going hands-off")
+            secFS:Slider("Slash Time", FS.Slash, 0.01, 0.05, 1, "s", function(v)
+                FS.Slash = tonumber(v) or 0.35
+            end):Tooltip("animation time still treated as the slash rather than the recovery tail")
         end
 
         local secInfo = tab:Section("Status", "Right", "Live")
         pcall(function()
             secInfo:Label(function()
                 if not AP.On then return "Auto Parry:  OFF   (" .. toName(AP.ToggleKey) .. ")" end
-                return "Auto Parry:  ON   parry=" .. toName(AP.Key)
+                return "Auto Parry:  ON"
             end)
         end)
         pcall(function() secInfo:Label(function() return "State:  " .. tostring(AP.Status or "-") end) end)
