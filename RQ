@@ -6190,6 +6190,14 @@ local AP = {
     -- and by the time they crossed 90 studs they were ~0.1s from impact. That is precisely why
     -- fast grapple-in attackers were never parried while stationary ones were.
     Watch = 170,
+    -- Round-trip ping in ms. This CANNOT be measured: Matcha has no GetNetworkPing, no
+    -- Stats:GetValue, no GetServerTimeNow, and DistributedGameTime reads nil — all verified live.
+    -- It matters twice over, which is why lateness persisted after the other fixes:
+    --   inbound  (RTT/2): what we observe is that stale. At 230 studs/s, 100ms = 23 STUDS of
+    --                     position error, so the geometry itself was systematically behind.
+    --   outbound (RTT/2): our keypress needs that long to reach the server, which decides the parry.
+    -- We correct the first by extrapolating the attacker forward, and the second by leading the press.
+    PingMs = 200,
     -- My hittable radius about the HRP, DERIVED from measurement rather than guessed:
     --   reachable envelope, HRP-to-HRP                     ~10.4 studs  (DmgPoint cloud analysis)
     --   measured outermost blade PART from attacker HRP     ~6.4 studs  (live, both hands)
@@ -6586,6 +6594,14 @@ task.spawn(function()
                                 local vdx = evel.X - myVel.X
                                 local vdy = evel.Y - myVel.Y
                                 local vdz = evel.Z - myVel.Z
+                                -- LAG COMPENSATION. Their position is RTT/2 old; ours is current.
+                                -- Extrapolate THEM forward so the geometry describes now, not then.
+                                local lin = (AP.PingMs or 0) / 2000
+                                local cdx = dx + evel.X * lin
+                                local cdy = dy + evel.Y * lin
+                                local cdz = dz + evel.Z * lin
+                                local cd3 = math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz)
+                                local dx, dy, dz, d3 = cdx, cdy, cdz, cd3
                                 local closing = 0
                                 if d3 > 0.01 then closing = -((dx * vdx + dy * vdy + dz * vdz) / d3) end
                                 local bkey = "body:" .. e.name .. ":" .. string.format("%.2f", e.swingAt)
@@ -6642,9 +6658,15 @@ task.spawn(function()
                                             vx = (tpos.X - rec.x) / dt
                                             vy = (tpos.Y - rec.y) / dt
                                             vz = (tpos.Z - rec.z) / dt
+                                            -- Lag-compensate the blade: what we see of them is
+                                            -- RTT/2 old, so shift the whole swept segment forward
+                                            -- along its own measured velocity before comparing it
+                                            -- against our CURRENT position.
+                                            local lin = (AP.PingMs or 0) / 2000
+                                            local ax, ay, az = rec.x + vx * lin, rec.y + vy * lin, rec.z + vz * lin
+                                            local bx, by, bz = tpos.X + vx * lin, tpos.Y + vy * lin, tpos.Z + vz * lin
                                             -- the swept segment the game would raycast right now
-                                            local sd = segDist(myPos.X, myPos.Y, myPos.Z,
-                                                rec.x, rec.y, rec.z, tpos.X, tpos.Y, tpos.Z)
+                                            local sd = segDist(myPos.X, myPos.Y, myPos.Z, ax, ay, az, bx, by, bz)
                                             -- and where that tip is heading relative to me
                                             local rx = vx - myVel.X
                                             local ry = vy - myVel.Y
@@ -6652,7 +6674,7 @@ task.spawn(function()
                                             -- 0.8s horizon, not 0.45: a swing thrown at 118 studs
                                             -- while closing at 230 studs/s lands ~0.47s later, which
                                             -- the old horizon clipped right at the boundary.
-                                            local pd, pt = closest(tpos.X - myPos.X, tpos.Y - myPos.Y, tpos.Z - myPos.Z,
+                                            local pd, pt = closest(bx - myPos.X, by - myPos.Y, bz - myPos.Z,
                                                 rx, ry, rz, 0.8)
                                             local thresh = AP.BodyR
                                             if sd <= thresh then
@@ -6680,8 +6702,12 @@ task.spawn(function()
             -- 55ms base lead, so a fixed lead is effectively late against a grapple-in. Pressing
             -- early is nearly free (the parry stays active ~1s per SUCCESSFUL_PARRY_WINDOW_SECONDS)
             -- whereas pressing late is a guaranteed hit, so the asymmetry says lead more, not less.
-            local lead = 0.055 + 3 * (AP.Dt or 0.01) + math.min(0.15, (bestClose or 0) * 0.0006)
-            if lead > 0.32 then lead = 0.32 end
+            -- OUTBOUND half of the ping: the server decides the parry, so the press has to be in
+            -- flight this long before contact. The geometry above is already lag-compensated for
+            -- the inbound half, so only RTT/2 is added here — adding the full RTT would double-count.
+            local lout = (AP.PingMs or 0) / 2000
+            local lead = 0.055 + lout + 3 * (AP.Dt or 0.01) + math.min(0.15, (bestClose or 0) * 0.0006)
+            if lead > 0.45 then lead = 0.45 end
             AP.Lead = lead
             AP.Active = (bestE ~= nil)
             if bestE and not blocked and bestT <= lead and (now - AP.LastPress) > 0.3 then
@@ -7733,6 +7759,12 @@ end)()
         end):Tooltip("tap to turn Auto Parry on/off without opening the menu")
         secMain:Toggle("Enemy Parry Cooldown", AP.ESP, function(v) AP.ESP = v end)
             :Tooltip("draws the lockout timer over anyone who just parried — they cannot defend while it runs")
+        -- Not a tuning knob: Matcha cannot read ping by ANY route (GetNetworkPing, Stats:GetValue,
+        -- GetServerTimeNow are all missing methods), so this is the one number the script cannot
+        -- obtain for itself. Set it to your real ping and it compensates both halves automatically.
+        secMain:Slider("Your Ping", math.floor(AP.PingMs or 200), 5, 0, 400, " ms", function(v)
+            AP.PingMs = tonumber(v) or 200
+        end):Tooltip("your ACTUAL round-trip ping. Half is used to un-stale what you see of them, half to lead the press")
 
         local secInfo = tab:Section("Status", "Right", "Live")
         pcall(function()
