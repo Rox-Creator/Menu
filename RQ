@@ -24,7 +24,7 @@ local GUI = {}
 -- Single source of truth: it renders as the badge beside the menu title, so there is exactly one
 -- place to edit. Format vMAJOR.MINOR; minor for normal changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.1"
+GUI.Version = "v2.2"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7112,11 +7112,12 @@ end)()
     local REQUIEM_LOGO = "https://tr.rbxcdn.com/180DAY-feffde8d73bda422f53dd31fc43d4ae3/150/150/Image/Png/noFilter"
     local window = Lib:CreateWindow({
         title     = "Requiem",
-        -- The version rides the SUBTITLE. `badge` is NOT a real option — the forked lib contains
-        -- zero references to it, so that field was silently ignored (Verfall's "v3" never rendered
-        -- either). Only title and subtitle are drawn in the header.
-        subtitle  = "Bro you don't go 290 velo   -   " .. GUI.Version,
+        subtitle  = "Bro you don't go 290 velo",
         size      = Vector2.new(640, 580),
+        -- `badge` is now a REAL option: the forked lib had zero references to it, so it was being
+        -- silently ignored. Patched the fork (Rox-Creator/aaa-v uilib.lua) to store az.badge and
+        -- draw it as an accent pill at the top of the content area.
+        badge     = GUI.Version,
         menuKey   = "f3",        -- F3 toggles the menu (matches the old bind)
         gameInput = "always",    -- never eat movement keys
     })
