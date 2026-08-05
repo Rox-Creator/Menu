@@ -6178,6 +6178,10 @@ WATCHED[ANIM_PARRY] = true
 local PARRY_ONLY = { [ANIM_PARRY] = true }   -- hoisted: allocating this per tick churned the GC
 
 local AP = {
+    -- Two-stage: the menu pill is the MASTER ARM (Enabled), the hotkey toggles the running state
+    -- (On) underneath it. The hotkey deliberately does NOT move the pill, and does nothing at all
+    -- while the pill is off.
+    Enabled = false,
     On = false,
     -- The in-game "Blade Parry" bind is always F (Gear keybind slot 10), so this is fixed rather
     -- than exposed — there was nothing useful to change it to.
@@ -6506,6 +6510,8 @@ local myGen = AP.Gen
 --                   Guessing a fixed freeze point does not work — combo animations freeze at
 --                   different places, which is what made earlier versions slip on rapid re-swings.
 local FS = {
+    -- same two-stage arrangement as Auto Parry: pill arms, hotkey runs
+    Enabled = false,
     On = false,
     Key = 0x48,        -- H
     Swing = 1.0,       -- playback rate for the active slash / windup boost
@@ -6587,16 +6593,17 @@ task.spawn(function()
             pcall(function() d = iskeypressed(FS.Key) and true or false end)
             if not ready then
                 if not d then ready = true end
-            elseif d and not wasK then
+            elseif d and not wasK and FS.Enabled then
+                -- only meaningful while armed, and it must NOT move the pill
                 FS.On = not FS.On
-                pcall(function() if GUI._uiFS then GUI._uiFS:Set(FS.On) end end)
                 pcall(function() uiNotify("Fast Swing", FS.On and "ON" or "OFF", 2) end)
             end
             wasK = d
 
-            if FS.On then fsApply(now) else FS.Phase = "-" end
+            local live = FS.Enabled and FS.On
+            if live then fsApply(now) else FS.Phase = "-" end
         end)
-        task.wait(FS.On and 1 / 200 or 1 / 30)
+        task.wait((FS.Enabled and FS.On) and 1 / 200 or 1 / 30)
     end
 end)
 
@@ -6624,11 +6631,9 @@ task.spawn(function()
             pcall(function() td = iskeypressed(AP.ToggleKey) and true or false end)
             if not toggleReady then
                 if not td then toggleReady = true end
-            elseif td and not wasToggle then
+            elseif td and not wasToggle and AP.Enabled then
+                -- only meaningful while armed, and it must NOT move the pill
                 AP.On = not AP.On
-                -- Push the new state back into the checkbox, or the hotkey flips the feature while
-                -- the switch sits there still showing the old position.
-                pcall(function() if GUI._uiAP then GUI._uiAP:Set(AP.On) end end)
                 pcall(function() uiNotify("Auto Parry", AP.On and "ON" or "OFF", 2) end)
             end
             wasToggle = td
@@ -6642,7 +6647,8 @@ task.spawn(function()
 
             -- cleared every tick: an early return below must not leave the loop sprinting
             AP.Active = false
-            if not AP.On then AP.Status = "off"; AP.Near = 0; return end
+            if not AP.Enabled then AP.Status = "disabled"; AP.Near = 0; return end
+            if not AP.On then AP.Status = "off (hotkey)"; AP.Near = 0; return end
 
             local ch = LP.Character
             local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -7955,8 +7961,13 @@ end)()
 
         -- Stored so the hotkey handler can push state back into the checkbox — otherwise the key
         -- flips the feature while the switch keeps showing the old position.
-        GUI._uiAP = secMain:Toggle("Auto Parry", AP.On, function(v) AP.On = v end)
-        pcall(function() GUI._uiAP:Tooltip("presses only when their blade sweep is about to reach your body") end)
+        -- The pill ARMS the feature; the hotkey then turns it on and off underneath, without ever
+        -- moving the pill. Arming starts it running so it is usable immediately.
+        GUI._uiAP = secMain:Toggle("Auto Parry", AP.Enabled, function(v)
+            AP.Enabled = v
+            AP.On = v
+        end)
+        pcall(function() GUI._uiAP:Tooltip("arms Auto Parry. Once armed, the hotkey toggles it on/off without moving this switch") end)
 
         -- Click-to-capture rather than a dropdown, so ANY key can be bound. Individually pcall'd:
         -- :Keybind exists in the forked lib but not necessarily in the upstream fallback, and
@@ -7981,8 +7992,11 @@ end)()
         if FS then
             local secFS = tab:Section("Fast Swing", "Left", "Your own swing animation speed")
 
-            GUI._uiFS = secFS:Toggle("Fast Swing", FS.On, function(v) FS.On = v end)
-            pcall(function() GUI._uiFS:Tooltip("speeds up your swing and skips the recovery tail — local only, nothing is sent to the server") end)
+            GUI._uiFS = secFS:Toggle("Fast Swing", FS.Enabled, function(v)
+                FS.Enabled = v
+                FS.On = v
+            end)
+            pcall(function() GUI._uiFS:Tooltip("arms Fast Swing. Once armed, the hotkey toggles it on/off without moving this switch") end)
             pcall(function()
                 secFS:Keybind("Fast Swing Key", toName(FS.Key), function(k)
                     local vk = toVK(k)
@@ -8004,9 +8018,11 @@ end)()
 
         local secInfo = tab:Section("Status", "Right", "Live")
         pcall(function()
+            -- The pill no longer moves with the hotkey, so this line is the only indication of the
+            -- running state.
             secInfo:Label(function()
-                if not AP.On then return "Auto Parry:  OFF   (" .. toName(AP.ToggleKey) .. ")" end
-                return "Auto Parry:  ON"
+                if not AP.Enabled then return "Auto Parry:  disarmed" end
+                return "Auto Parry:  " .. (AP.On and "ON" or "OFF") .. "   (" .. toName(AP.ToggleKey) .. ")"
             end)
         end)
         pcall(function() secInfo:Label(function() return "State:  " .. tostring(AP.Status or "-") end) end)
@@ -8024,8 +8040,9 @@ end)()
         pcall(function()
             secInfo:Label(function()
                 if not FS then return "Fast Swing:  unavailable" end
+                if not FS.Enabled then return "Fast Swing:  disarmed" end
                 if not FS.On then return "Fast Swing:  OFF   (" .. toName(FS.Key) .. ")" end
-                return string.format("Fast Swing:  %s   %s", FS.M1 and "M1 HELD" or "idle", tostring(FS.Phase or "-"))
+                return string.format("Fast Swing:  ON   %s   %s", FS.M1 and "M1 HELD" or "idle", tostring(FS.Phase or "-"))
             end)
         end)
         secInfo:Button("Reset Learned Values", function()
