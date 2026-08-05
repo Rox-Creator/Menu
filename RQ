@@ -6184,6 +6184,12 @@ local AP = {
     ESP = true,          -- enemy parry-cooldown readout
     -- learned, not configured
     CD = C_WHIFF_LOCKOUT,     -- parry cooldown; learned DOWN if we ever re-parry sooner
+    -- Watch radius. MEASURED, not guessed: an ODM player grappling in starts their swing at
+    -- 115-119 studs while closing at 222-246 studs/s, and the swing only lasts ~0.85s. The old
+    -- 90-stud radius meant the swing began OUTSIDE it entirely — no candidate was ever created,
+    -- and by the time they crossed 90 studs they were ~0.1s from impact. That is precisely why
+    -- fast grapple-in attackers were never parried while stationary ones were.
+    Watch = 170,
     -- My hittable radius about the HRP, DERIVED from measurement rather than guessed:
     --   reachable envelope, HRP-to-HRP                     ~10.4 studs  (DmgPoint cloud analysis)
     --   measured outermost blade PART from attacker HRP     ~6.4 studs  (live, both hands)
@@ -6325,6 +6331,9 @@ local function rebuildRoster()
                         out[#out + 1] = {
                             name = nm, A = ad, hrp = hrp, char = c, charAddr = ca,
                             tips = keep and prev.tips or nil,
+                            span = keep and prev.span or nil,
+                            -- carried so a roster rebuild mid-approach cannot drop the swing latch
+                            swingAt = (prev and prev.swingAt) or nil,
                             parryAt = (prev and prev.parryAt) or 0,
                             wasParry = (prev and prev.wasParry) or false,
                         }
@@ -6374,7 +6383,12 @@ local function resolveTips(e)
                     end
                 end
             end
-            if best then tips[#tips + 1] = best end
+            if best then
+                tips[#tips + 1] = best
+                -- Their real blade span, measured from their own gear rather than assumed. The
+                -- fast-closer path needs this to know how far out their blade can reach.
+                if bestd > (e.span or 0) then e.span = bestd end
+            end
         end
     end
     -- Only cache a SUCCESSFUL resolve, so a transient nil read cannot permanently disarm this player.
@@ -6512,16 +6526,35 @@ task.spawn(function()
             if now - AP.RosterAt > 2 then AP.RosterAt = now; rebuildRoster() end
 
             local bestT, bestE, bestD, bestK = 9, nil, 0, nil
+            local bestClose = 0
             local near = 0
 
+            -- PASS 1: cheap distance prefilter — one position read per player, and nothing else
+            -- for anyone far away.
+            local nearList = {}
             for _, e in ipairs(AP.Roster) do
                 local epos
                 pcall(function() epos = e.hrp.Position end)
                 if epos then
-                    local dx, dy, dz = epos.X - myPos.X, epos.Y - myPos.Y, epos.Z - myPos.Z
-                    local d3 = math.sqrt(dx * dx + dy * dy + dz * dz)   -- 3D: air swings come from above and below
-                    if d3 < 90 then
-                        near = near + 1
+                    local ndx, ndy, ndz = epos.X - myPos.X, epos.Y - myPos.Y, epos.Z - myPos.Z
+                    local nd3 = math.sqrt(ndx * ndx + ndy * ndy + ndz * ndz)  -- 3D: air swings come from above and below
+                    if nd3 < AP.Watch then
+                        nearList[#nearList + 1] = { e = e, d = nd3, dx = ndx, dy = ndy, dz = ndz }
+                    end
+                end
+            end
+            table.sort(nearList, function(a, b) return a.d < b.d end)
+            near = #nearList
+            -- PASS 2: the expensive work (animator walk, blade reads) for the NEAREST few only, so
+            -- a crowded server cannot stall the loop and make us late.
+            local lim = near
+            if lim > 8 then lim = 8 end
+            for li = 1, lim do
+                local nl = nearList[li]
+                local e, d3 = nl.e, nl.d
+                local dx, dy, dz = nl.dx, nl.dy, nl.dz
+                do
+                    do
                         -- ONE walk per player per tick, covering swings AND their parry. Two
                         -- separate scans would double the cost of the hottest path in the loop.
                         local aid, tptr = scan(e.A, WATCHED)
@@ -6532,6 +6565,59 @@ task.spawn(function()
                         if isParry and not e.wasParry then e.parryAt = now end
                         e.wasParry = isParry
                         if sid then e.parryAt = 0 end   -- they are swinging, so not locked out
+
+                        -- ================= PATH 2: the fast closer =================
+                        -- The blade-sweep test below is precise, but it only runs WHILE the swing
+                        -- animation is playing. A player who slashes early at range and then
+                        -- grapples in finishes that animation in mid-air, so the weight gate drops
+                        -- them while they are still inbound and the sweep test never gets to run —
+                        -- then they arrive and the hit lands. That is the case that felt unparryable.
+                        --
+                        -- So: latch the swing, and for anyone CLOSING FAST predict when their body
+                        -- arrives inside blade range instead of waiting for the tip to reach us.
+                        -- Gating on closing speed is what keeps this from re-introducing the bait —
+                        -- a stationary attacker swinging at air has ~zero closing speed and can
+                        -- never take this path.
+                        if sid then e.swingAt = now end
+                        if e.swingAt and (now - e.swingAt) < 1.0 then
+                            local evel
+                            pcall(function() evel = e.hrp.AssemblyLinearVelocity end)
+                            if evel then
+                                local vdx = evel.X - myVel.X
+                                local vdy = evel.Y - myVel.Y
+                                local vdz = evel.Z - myVel.Z
+                                local closing = 0
+                                if d3 > 0.01 then closing = -((dx * vdx + dy * vdy + dz * vdz) / d3) end
+                                local bkey = "body:" .. e.name .. ":" .. string.format("%.2f", e.swingAt)
+                                if closing > 30 and not AP.Fired[bkey] then
+                                    -- Effective reach grows with closing speed because the game
+                                    -- raycasts each DmgPoint along its OWN per-frame displacement —
+                                    -- at 300 studs/s that is ~5 extra studs per frame. This is the
+                                    -- mechanism behind "he hit me from further than he should".
+                                    local reach = (e.span or 6.5) + AP.BodyR + closing * (1 / 60)
+                                    local qa = vdx * vdx + vdy * vdy + vdz * vdz
+                                    local qb = 2 * (dx * vdx + dy * vdy + dz * vdz)
+                                    local qc = d3 * d3 - reach * reach
+                                    local tHit = nil
+                                    if qc <= 0 then
+                                        tHit = 0                      -- already inside reach
+                                    elseif qa > 0.000001 then
+                                        local disc = qb * qb - 4 * qa * qc
+                                        if disc >= 0 then
+                                            local r = (-qb - math.sqrt(disc)) / (2 * qa)
+                                            if r >= 0 then tHit = r end
+                                        end
+                                    end
+                                    if tHit and tHit < bestT then
+                                        bestT = tHit
+                                        bestE = e
+                                        bestD = reach
+                                        bestK = bkey
+                                        bestClose = closing
+                                    end
+                                end
+                            end
+                        end
 
                         if sid and tptr then
                             local key = e.name .. ":" .. tostring(tptr) .. ":" .. sid
@@ -6563,8 +6649,11 @@ task.spawn(function()
                                             local rx = vx - myVel.X
                                             local ry = vy - myVel.Y
                                             local rz = vz - myVel.Z
+                                            -- 0.8s horizon, not 0.45: a swing thrown at 118 studs
+                                            -- while closing at 230 studs/s lands ~0.47s later, which
+                                            -- the old horizon clipped right at the boundary.
                                             local pd, pt = closest(tpos.X - myPos.X, tpos.Y - myPos.Y, tpos.Z - myPos.Z,
-                                                rx, ry, rz, 0.45)
+                                                rx, ry, rz, 0.8)
                                             local thresh = AP.BodyR
                                             if sd <= thresh then
                                                 if 0 < bestT then bestT = 0; bestE = e; bestD = sd; bestK = key end
@@ -6587,8 +6676,12 @@ task.spawn(function()
             -- it lands; one press per swing track, and never faster than 0.3s apart.
             -- Commit lead = fixed input+network allowance + a few measured ticks of detection lag.
             -- Pressing early is cheap (the parry stays active ~1s); pressing late is a free hit.
-            local lead = 0.055 + 3 * (AP.Dt or 0.01)
-            if lead > 0.30 then lead = 0.30 end
+            -- Scale the lead with closing speed. At 230 studs/s the attacker covers ~13 studs in the
+            -- 55ms base lead, so a fixed lead is effectively late against a grapple-in. Pressing
+            -- early is nearly free (the parry stays active ~1s per SUCCESSFUL_PARRY_WINDOW_SECONDS)
+            -- whereas pressing late is a guaranteed hit, so the asymmetry says lead more, not less.
+            local lead = 0.055 + 3 * (AP.Dt or 0.01) + math.min(0.15, (bestClose or 0) * 0.0006)
+            if lead > 0.32 then lead = 0.32 end
             AP.Lead = lead
             AP.Active = (bestE ~= nil)
             if bestE and not blocked and bestT <= lead and (now - AP.LastPress) > 0.3 then
