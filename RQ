@@ -24,7 +24,7 @@ local GUI = {}
 -- Single source of truth: it renders as the badge beside the menu title, so there is exactly one
 -- place to edit. Format vMAJOR.MINOR; minor for normal changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.2"
+GUI.Version = "v2.3"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7398,14 +7398,9 @@ end)()
 
         -- key -> { lo, hi = accept range (excludes hash decoys, spans every slider value), fb = default }
         local CFG = {
-            ERADICATE_CHAIN_MAX_KILLS   = { lo = 2, hi = 50,    fb = 3    },
-            ERADICATE_CHAIN_LOCKOUT_SEC = { lo = 1, hi = 200,   fb = 120  },
-            ERADICATE_CHAIN_WINDOW_SEC  = { lo = 2, hi = 60,    fb = 10   },
-            GearGrappleRangeMultiplier  = { lo = 0, hi = 1000,  fb = 1    },
             GearAdditionalGrappleRange  = { lo = 0, hi = 20000, fb = 0    },
             GearMaxVelocityMultiplier   = { lo = 0, hi = 100,   fb = 1.11 },
             GearVelocityIncreaseRate    = { lo = 0, hi = 100,   fb = 1.75 },
-            GearVelocityDecayRate       = { lo = 0, hi = 100,   fb = 1.1  },
             -- Dash (Canisters) + Burst Dash (Client Unique enchant) + Blades parry — added 2026-07-03,
             -- all confirmed as the ONLY numeric entry for their key (live getgc). ⚠ GAS_COST hi is
             -- capped BELOW 240 so we only ever hit the CLIENT Burst Dash (150), never the SERVER
@@ -7558,47 +7553,33 @@ end)()
             end)
         end
 
-        -- ---------- Eradicate (Sentinel chain capstone) ----------
-        local secEr = tab:Section("Eradicate", "Left", "Chain kills / lockout / window")
-        local erKills, erLock = CFG.ERADICATE_CHAIN_MAX_KILLS.fb, CFG.ERADICATE_CHAIN_LOCKOUT_SEC.fb
-        local erWindow = CFG.ERADICATE_CHAIN_WINDOW_SEC.fb
-        secEr:Slider("Chain Max Kills", erKills, 1, 3, 50, "", function(v) erKills = math.floor(tonumber(v) or erKills) end)
-        secEr:Slider("Chain Lockout", erLock, 1, 1, 120, "s", function(v) erLock = math.floor(tonumber(v) or erLock) end)
-        secEr:Slider("Chain Window", erWindow, 1, 10, 50, "s", function(v) erWindow = math.floor(tonumber(v) or erWindow) end)
-        secEr:Button("Apply Eradicate", function()
-            applyMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC", "ERADICATE_CHAIN_WINDOW_SEC" }, { erKills, erLock, erWindow })
-        end)
-        secEr:Button("Reset Default", function()
-            resetMany("Eradicate", { "ERADICATE_CHAIN_MAX_KILLS", "ERADICATE_CHAIN_LOCKOUT_SEC", "ERADICATE_CHAIN_WINDOW_SEC" })
-        end)
-
         -- ---------- Grapple (ODM hook range) ----------
+        -- Additional Range only. GearGrappleRangeMultiplier is no longer written at all (its slider
+        -- was removed), so the projection is a plain 400 + additional.
         local secGr = tab:Section("Grapple", "Left", "ODM hook range")
-        local grMult, grAdd = CFG.GearGrappleRangeMultiplier.fb, CFG.GearAdditionalGrappleRange.fb
-        secGr:Slider("Range Multiplier", grMult, 0.5, 1, 25, "x", function(v) grMult = tonumber(v) or grMult end)
+        local grAdd = CFG.GearAdditionalGrappleRange.fb
         secGr:Slider("Additional Range", grAdd, 50, 0, 5000, "", function(v) grAdd = math.floor(tonumber(v) or grAdd) end)
         secGr:Label(function()
-            return string.format("Est. hook range  ~%d studs  (stock 400)", math.floor((grAdd + 400) * grMult + 0.5))
+            return string.format("Est. hook range  ~%d studs  (stock 400)", math.floor(grAdd + 400 + 0.5))
         end)
         secGr:Button("Apply Grapple", function()
-            applyMany("Grapple", { "GearGrappleRangeMultiplier", "GearAdditionalGrappleRange" }, { grMult, grAdd })
+            applyMany("Grapple", { "GearAdditionalGrappleRange" }, { grAdd })
         end)
         secGr:Button("Reset Default", function()
-            resetMany("Grapple", { "GearGrappleRangeMultiplier", "GearAdditionalGrappleRange" })
+            resetMany("Grapple", { "GearAdditionalGrappleRange" })
         end)
 
         -- ---------- Velocity (ODM speed build-up) ----------
         local secVe = tab:Section("Velocity", "Right", "ODM speed build-up")
-        local veMax, veInc, veDec = CFG.GearMaxVelocityMultiplier.fb, CFG.GearVelocityIncreaseRate.fb, CFG.GearVelocityDecayRate.fb
+        local veMax, veInc = CFG.GearMaxVelocityMultiplier.fb, CFG.GearVelocityIncreaseRate.fb
         GUI.VeloMult = veMax   -- feed the Tools "Velocity Indicator" popup
         secVe:Slider("Max Velocity", veMax, 0.01, 0.5, 3, "x", function(v) veMax = tonumber(v) or veMax; GUI.VeloMult = veMax end)
         secVe:Slider("Increase Rate", veInc, 0.05, 0.5, 5, "x", function(v) veInc = tonumber(v) or veInc end)
-        secVe:Slider("Decay Rate", veDec, 0.05, 0, 3, "x", function(v) veDec = tonumber(v) or veDec end)
         secVe:Button("Apply Velocity", function()
-            applyMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate", "GearVelocityDecayRate" }, { veMax, veInc, veDec })
+            applyMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate" }, { veMax, veInc })
         end)
         secVe:Button("Reset Default", function()
-            resetMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate", "GearVelocityDecayRate" })
+            resetMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate" })
         end)
 
         -- SMART ADDITIVE auto-apply (experimental). The plain overwrite flattened server buffs;
@@ -7616,8 +7597,7 @@ end)()
         local veAutoGen = 0
         local function veSlider(key)
             if key == "GearMaxVelocityMultiplier" then return veMax end
-            if key == "GearVelocityIncreaseRate" then return veInc end
-            return veDec
+            return veInc
         end
         secVe:Toggle("Auto-Apply (Exp)", false, function(v)
             if not v then veAutoGen = veAutoGen + 1; return end   -- off -> invalidate the running loop
@@ -7628,7 +7608,7 @@ end)()
             task.spawn(function()
                 local canRead = type(memory_read) == "function"
                 while veAutoGen == myGen and GUI.Running do
-                    for _, key in ipairs({ "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate", "GearVelocityDecayRate" }) do
+                    for _, key in ipairs({ "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate" }) do
                         local safe = entriesFor(key)           -- cached filtered entries (fast; no re-scan)
                         local base = savedDefault[key]
                         if #safe > 0 and base then
@@ -7654,8 +7634,6 @@ end)()
                 end
             end)
         end):Tooltip("experimental - reads your LIVE velocity each cycle (instant memory read, no freeze) and STACKS your boost on top of server buffs; never lowers you")
-
-        secVe:Label(function() return "Live projection  ->  Tools  ->  Velocity Indicator" end)
 
         -- ---------- Dash (Canisters + Client Burst Dash) — ONE button sets all four ----------
         -- Fixed targets (not sliders): Fallback Min Speed 150->220, Base Gas 50->0,
@@ -7683,15 +7661,17 @@ end)()
             resetMany("Parry", { "NON_SUCCESSFUL_PARRY_WINDOW_SECONDS" })
         end)
 
-        -- ---------- Firearms (Muskets + Flintlocks): zero spread + recoil ----------
+        -- ---------- Firearms (EVERY gun): zero inaccuracy + recoil ----------
         -- Sets BASE_INACCURACY_OFFSET (7.5) + BASE_RECOIL_IMPULSE (2) -> 0. Both are client-read
         -- (spread in getProjectilePhysics, recoil in the AddVelocity kick), so 0 = dead-center,
         -- no kick. getgc matches the key across EVERY firearm config (defaults differ: inaccuracy
         -- 2.5/7.5/8.5, recoil 2/4) so "Zero" writes 0 to all guns; "Restore" writes each gun's OWN
         -- captured original back PER-ENTRY (applygc on a 1-entry list = that one address only), so
         -- the 2.5/8.5/4 guns are never flattened to a single value.
-        local secFire = tab:Section("Firearms", "Right", "Muskets + Flintlocks: no spread / no recoil")
-        secFire:Label(function() return "Inaccuracy 0 | Recoil 0" end)
+        -- This INCLUDES the BlunderBuss: it shares both keys with the other guns, which is why its
+        -- own panel below no longer carries inaccuracy / recoil sliders — this one button covers it.
+        local secFire = tab:Section("Firearms", "Right", "Every gun: no spread / no recoil")
+        secFire:Label(function() return "Inaccuracy 0 | Recoil 0   (all guns, incl. BlunderBuss)" end)
         local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
         local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the first zero
         secFire:Button("Apply Firearms", function()
@@ -7727,7 +7707,16 @@ end)()
             end)
         end)
 
-        -- ---------- Blunderbuss (TEST): live-tune inaccuracy / recoil / pellet spread ----------
+        -- ---------- Blunderbuss (TEST): live-tune pellet spread ----------
+        -- Inaccuracy and recoil moved OUT of this panel and into the Firearms button above (which
+        -- zeroes them on every gun, BlunderBuss included). What's left here is PELLET_SPREAD_OFFSET
+        -- — the pellet CONE, which only the two pellet guns have and which nothing else touches.
+        --
+        -- The fingerprint below no longer stock-checks inaccuracy/recoil, and that removal is
+        -- REQUIRED, not a shortcut: the Firearms button zeroes those exact slots, so a
+        -- "must still be at stock" test on them would abort this panel forever the moment you used
+        -- it. Identity is still pinned by the anchor pair plus a unique, at-stock spread slot.
+        --
         -- WHY THIS ISN'T JUST "getgc the key and write it": the BlunderBuss SHARES
         -- BASE_INACCURACY_OFFSET 7.5 with the Musket and the Flintlock, and BASE_RECOIL_IMPULSE 2
         -- with FOUR other guns. Writing by name (or by value) retunes every one of them.
@@ -7738,10 +7727,10 @@ end)()
         -- recoil 2 / spread 8.35 / PELLET_COUNT 10 all landed in ONE ~900-byte window, while the
         -- nearest competing same-key entry was 5,000+ bytes out (a 30-80x margin).
         --
-        -- Nearest-address ALONE is not safe: inaccuracy has 7 numeric entries but recoil only 6, so
-        -- one gun's table lacks the key entirely and an unbounded "closest" would silently pick a
-        -- DIFFERENT weapon. Every candidate must therefore (a) sit within BB_WINDOW of the anchor
-        -- AND (b) currently hold its stock value, and any 0-or->1 match ABORTS without writing.
+        -- Nearest-address ALONE is not safe: one gun's table can lack a key entirely, so an
+        -- unbounded "closest" would silently pick a DIFFERENT weapon. The candidate must therefore
+        -- (a) sit within BB_WINDOW of the anchor AND (b) currently hold its stock value, and any
+        -- 0-or->1 match ABORTS without writing.
         --
         -- The anchor uses only keys this section never writes (PELLET_COUNT 10 +
         -- SPREAD_REFERENCE_DISTANCE 45 -- which are also exactly what separates the BlunderBuss from
@@ -7752,26 +7741,24 @@ end)()
         -- whole heap and is the documented corruption path). Each write is compare-and-swap'd first
         -- and read back after, so a stale address reports instead of scribbling somewhere random.
         -- PELLET_COUNT is deliberately NOT tunable here.
-        local BB_STOCK  = { inacc = 75/10, recoil = 2, spread = 835/100 }  -- integer fractions: Matcha's
-                                                                           -- parser has choked on some decimal literals
-        local BB_KEY    = { inacc = "BASE_INACCURACY_OFFSET", recoil = "BASE_RECOIL_IMPULSE", spread = "PELLET_SPREAD_OFFSET" }
-        local BB_ORDER  = { "inacc", "recoil", "spread" }
-        local BB_LABEL  = { inacc = "Inacc", recoil = "Recoil", spread = "Spread" }
-        local BB_SCAN   = { "PELLET_COUNT", "SPREAD_REFERENCE_DISTANCE",
-                            "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE", "PELLET_SPREAD_OFFSET" }
+        local BB_STOCK  = { spread = 835/100 }   -- integer fraction: Matcha's parser has choked on
+                                                 -- some decimal literals
+        local BB_KEY    = { spread = "PELLET_SPREAD_OFFSET" }
+        local BB_ORDER  = { "spread" }
+        local BB_LABEL  = { spread = "Spread" }
+        local BB_SCAN   = { "PELLET_COUNT", "SPREAD_REFERENCE_DISTANCE", "PELLET_SPREAD_OFFSET" }
         local BB_WINDOW = 2048        -- max bytes from the anchor. Live: our own slots are 64-800 out
                                       -- and the nearest OTHER gun's slot is 4936 -> 2.4x headroom.
         local BB_EPS    = 1/1000000   -- NOT 1e-6: sci-notation literals can trip Matcha's parser
                                       -- ("Malformed number"), which would kill the whole chunk
         local BB_STEP   = 5/100       -- 0.05: the lib derives display precision from step MAGNITUDE,
                                       -- so 0.05 is exact but 0.25 would render as 0.3
-        local bbStatus  = bbState.ok and "Slots resolved - press Apply" or "Idle - press Apply"
-        -- Last value written per slot, persisted per-server so a script RE-RUN seeds the sliders from
-        -- what is actually in memory instead of snapping the UI back to stock (which Auto-Apply would
-        -- then silently write back, undoing the tune).
-        local bbLive    = bbState.live or { inacc = BB_STOCK.inacc, recoil = BB_STOCK.recoil, spread = BB_STOCK.spread }
+        local bbStatus  = bbState.ok and "Slot resolved - press Apply" or "Idle - press Apply"
+        -- Last value written, persisted per-server so a script RE-RUN seeds the slider from what is
+        -- actually in memory instead of snapping the UI back to stock while the tune is still live.
+        local bbLive    = bbState.live or { spread = BB_STOCK.spread }
         bbState.live    = bbLive
-        local bbVal     = { inacc = bbLive.inacc, recoil = bbLive.recoil, spread = bbLive.spread }
+        local bbVal     = { spread = bbLive.spread or BB_STOCK.spread }
 
         -- getgc reports .addr as a number in-VM but as a hex string on some builds -> take both.
         local function bbAddr(e)
@@ -7784,12 +7771,12 @@ end)()
         local function bbNum(v) local n = tonumber(v); if n and n == n then return n end return nil end
         local function bbNear(a, b) return a ~= nil and b ~= nil and math.abs(a - b) <= BB_EPS end
 
-        -- ONE snapshot for all five keys. This is load-bearing: entriesFor() re-scans a key whose
-        -- cache list is EMPTY and never re-scans one that is populated, so the shotgun-only anchor
-        -- keys could come from a fresh sweep while inaccuracy/recoil came from an older one. In that
-        -- split the BlunderBuss's own inaccuracy slot may be absent from the candidate list entirely,
-        -- and the nearest survivor is a Musket (same stock 7.5 / 2) -- an invisible mis-resolve that
-        -- no later check could catch. Reading one snapshot makes that impossible.
+        -- ONE snapshot for all three keys. This is load-bearing: entriesFor() re-scans a key whose
+        -- cache list is EMPTY and never re-scans one that is populated, so the anchor keys could
+        -- come from a fresh sweep while the spread key came from an older one. In that split the
+        -- BlunderBuss's own spread slot may be absent from the candidate list entirely and the
+        -- nearest survivor belongs to the other pellet gun -- an invisible mis-resolve that no later
+        -- check could catch. Reading one snapshot makes that impossible.
         -- Prefer the Load Values sweep (already paid for); only if the BlunderBuss wasn't resident
         -- then do we spend one dedicated getgc, rate-limited so a retry can't become a scan loop.
         local function bbSnapshot()
@@ -7842,7 +7829,7 @@ end)()
             return hits[1]
         end
 
-        -- Each slot must be the ONLY entry of its key inside the window (a moat: a second one means
+        -- The slot must be the ONLY entry of its key inside the window (a moat: a second one means
         -- another gun's table is co-located and we cannot tell them apart) AND still hold its stock
         -- value. Anything else aborts without writing.
         local function bbResolveFresh()
@@ -7868,7 +7855,7 @@ end)()
         -- Resolve once per server, then reuse: after the first write the stock-value test can never
         -- pass again. Same Lua VM = same addresses (Luau's GC never moves objects); a rejoin makes a
         -- new JobId, which rebuilds the whole cache against a freshly-stock game. NOTE: the latch is
-        -- set by bbApply only after all three writes verify, so a bad resolve is never made sticky.
+        -- set by bbApply only after the write verifies, so a bad resolve is never made sticky.
         local function bbResolve()
             if bbState.ok and bbState.slots then return bbState.slots end
             return bbResolveFresh()
@@ -7877,8 +7864,7 @@ end)()
         -- One slot: sanity-check the address still reads a plausible value for this key, write via a
         -- ONE-entry applygc, then read back to prove it landed. The check is a RANGE not an equality:
         -- identity was already established at resolve time, so its only job here is catching a
-        -- dangling pointer -- and an equality check would deadlock the section the moment the
-        -- "Apply Firearms" button above zeroes these same slots.
+        -- dangling pointer -- an equality check would refuse every write after the first one.
         local function bbWriteSlot(slot, e, value)
             local a = bbAddr(e)
             if not a then return false, "no address" end
@@ -7918,7 +7904,7 @@ end)()
                     parts[#parts + 1] = BB_LABEL[slot] .. " " .. tostring(err)
                 end
             end
-            -- only make the resolution sticky once every write has been verified
+            -- only make the resolution sticky once the write has been verified
             if okAll then bbState.ok, bbState.slots = true, slots end
             bbStatus = (okAll and tag or "PARTIAL") .. ": " .. table.concat(parts, " | ")
             if not quiet then notif("Blunderbuss", bbStatus, okAll and 3 or 5) end
@@ -7926,12 +7912,6 @@ end)()
 
         local secBB = tab:Section("Blunderbuss (Test)", "Right", "BlunderBuss ONLY - other guns untouched")
         secBB:Label(function() return bbStatus end)
-        secBB:Slider("Inaccuracy", bbVal.inacc, BB_STEP, 0, BB_STOCK.inacc, "",
-            function(v) bbVal.inacc = tonumber(v) or bbVal.inacc end,
-            "Aim-point scatter, ramped by distance. 0 = dead centre. Stock 7.5")
-        secBB:Slider("Recoil", bbVal.recoil, BB_STEP, 0, BB_STOCK.recoil, "",
-            function(v) bbVal.recoil = tonumber(v) or bbVal.recoil end,
-            "Camera kick impulse. 0 = no kick. Stock 2")
         secBB:Slider("Pellet Spread", bbVal.spread, BB_STEP, 0, BB_STOCK.spread, "",
             function(v) bbVal.spread = tonumber(v) or bbVal.spread end,
             "Pellet cone radius (x max(0.5, accuracy)). 0 = all 10 pellets dead centre. Stock 8.35")
@@ -7939,30 +7919,11 @@ end)()
             if not gateOK() then return end
             task.spawn(function() bbApply(bbVal, "Applied") end)
         end)
-        secBB:Button("Restore Stock", function()
+        secBB:Button("Restore Default", function()
             if not gateOK() then return end
-            -- reset the slider-backed values too, or Auto-Apply's next tick writes the tune back
-            bbVal.inacc, bbVal.recoil, bbVal.spread = BB_STOCK.inacc, BB_STOCK.recoil, BB_STOCK.spread
+            bbVal.spread = BB_STOCK.spread   -- keep the slider in step with what we just wrote
             task.spawn(function() bbApply(BB_STOCK, "Restored") end)
         end)
-        local bbAutoGen = 0
-        secBB:Toggle("Auto-Apply", false, function(on)
-            bbAutoGen = bbAutoGen + 1                     -- off -> invalidate the running loop
-            if not on then return end
-            if not gateOK() then return end
-            local myGen = bbAutoGen
-            task.spawn(function()
-                local last = {}
-                while bbAutoGen == myGen and GUI.Running do
-                    if not (bbNear(last.inacc, bbVal.inacc) and bbNear(last.recoil, bbVal.recoil)
-                        and bbNear(last.spread, bbVal.spread)) then
-                        last.inacc, last.recoil, last.spread = bbVal.inacc, bbVal.recoil, bbVal.spread
-                        bbApply(bbVal, "Auto", true)      -- quiet: status shows in the Label, no toasts
-                    end
-                    task.wait(1/2)
-                end
-            end)
-        end):Tooltip("Re-applies within ~0.5s of moving a slider, so you can tune while shooting")
     end)
 
     -- ===== Tab: Auto Parry =====
