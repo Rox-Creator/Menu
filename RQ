@@ -24,7 +24,7 @@ local GUI = {}
 -- Single source of truth: it renders as the badge beside the menu title, so there is exactly one
 -- place to edit. Format vMAJOR.MINOR; minor for normal changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.0"
+GUI.Version = "v2.1"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7112,21 +7112,31 @@ end)()
     local REQUIEM_LOGO = "https://tr.rbxcdn.com/180DAY-feffde8d73bda422f53dd31fc43d4ae3/150/150/Image/Png/noFilter"
     local window = Lib:CreateWindow({
         title     = "Requiem",
-        subtitle  = "Bro you don't go 290 velo",
+        -- The version rides the SUBTITLE. `badge` is NOT a real option — the forked lib contains
+        -- zero references to it, so that field was silently ignored (Verfall's "v3" never rendered
+        -- either). Only title and subtitle are drawn in the header.
+        subtitle  = "Bro you don't go 290 velo   -   " .. GUI.Version,
         size      = Vector2.new(640, 580),
-        badge     = GUI.Version,
         menuKey   = "f3",        -- F3 toggles the menu (matches the old bind)
         gameInput = "always",    -- never eat movement keys
     })
     GUI._lib = Lib
     GUI._window = window
+    -- Generation token: a re-run builds a NEW window, and without this the previous run's logo
+    -- thread keeps firing SetLogo at the old/destroyed one for another 12s.
+    GUI.LogoGen = (GUI.LogoGen or 0) + 1
+    local logoGen = GUI.LogoGen
     task.spawn(function()
         local ok, png = pcall(function() return game:HttpGet(REQUIEM_LOGO) end)
         if not (ok and type(png) == "string" and #png > 24
             and string.byte(png, 1) == 0x89 and string.byte(png, 2) == 0x50) then return end
-        for _ = 1, 24 do   -- ~12s of re-asserts to beat the async config-autoload
+        -- DECAYING re-assert schedule, not 24 uniform 0.5s hits. Every SetLogo re-decodes the PNG,
+        -- and hammering it 24 times is what made the logo visibly blink in and out for 12 seconds.
+        -- A few early asserts are all that is needed to beat the lib's async config-autoload.
+        for _, waitFor in ipairs({ 0, 0.3, 0.4, 0.8, 1.5, 3 }) do
+            if waitFor > 0 then task.wait(waitFor) end
+            if GUI.LogoGen ~= logoGen then return end   -- a newer run owns the window now
             pcall(function() window:SetLogo(png) end)
-            task.wait(0.5)
         end
     end)
     _G.MatchaCleanup = function() pcall(function() Lib:Destroy() end) end
