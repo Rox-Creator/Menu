@@ -6293,7 +6293,11 @@ end
 
 -- One walk, one pass: returns the first id found from `want`, plus its track pointer and TimePosition.
 -- The owner check is load-bearing: foreign tracks genuinely appear in this list.
-local function scan(A, want)
+-- `ignoreWeight` exists for one caller: confirming OUR OWN parry. Parry Cancel deliberately zeroes
+-- that track's blend weight, which would otherwise make our own parry invisible to the confirmation
+-- logic and leave the cooldown model permanently wrong. The advancing() check still guards against
+-- a stale track, so dropping the weight requirement here is safe.
+local function scan(A, want, ignoreWeight)
     local head = rptr(A + OA)
     if not head or head < 0x10000 then return nil end
     local node, guard = rptr(head + ON), 0
@@ -6304,9 +6308,13 @@ local function scan(A, want)
             local id = trackId(t)
             if id and want[id] then
                 -- liveness: only a track that is actually blended in counts
-                local wt = rflt(t + OWT)
-                local w = rflt(t + OW)
-                if wt and w and wt > 0.5 and w > 0.05 then
+                local live = true
+                if not ignoreWeight then
+                    local wt = rflt(t + OWT)
+                    local w = rflt(t + OW)
+                    live = (wt and w and wt > 0.5 and w > 0.05) and true or false
+                end
+                if live then
                     local tp = rflt(t + OP) or 0
                     if advancing(t, tp, os.clock()) then
                         return id, t, tp
@@ -6527,6 +6535,66 @@ for id in pairs(SWINGS) do FS_SWINGS[id] = true end
 for _, id in ipairs({ "112666168396669", "86140055867484", "124361532701064", "136621055776523",
                       "82666636655771", "75659520618730", "89635808450635" }) do FS_SWINGS[id] = true end
 
+-- ============================================================
+-- PARRY CANCEL (TEST)  —  suppress the parry animation, keep the parry
+-- ============================================================
+-- The parry OUTCOME is decided server-side from the keybind press (Gear.Parry arrives as a RESULT
+-- event), and nothing in the recovered Blades.Default logic keys the parry off its own animation
+-- keyframes — the windows are plain time constants. So the raised-blades pose should be purely
+-- cosmetic, and killing it ought to leave the parry itself intact.
+--
+-- Two independent kills, because it is not knowable from this side which one replicates:
+--   Zero Blend    — weight and weight-target to 0, so the pose contributes nothing to the rig
+--   Cancel Speed  — fast-forward the track so it burns to its end almost immediately
+--
+-- HONEST LIMIT: whether OTHER players still see the animation cannot be determined from this
+-- client. Roblox replicates animation state from the owning client, but these are raw memory
+-- writes, which may bypass whatever notifies the replicator. If it turns out only the local view
+-- is suppressed, that is the mechanism to blame, and the fix would have to come from the API side
+-- (which Matcha does not expose — GetPlayingAnimationTracks is missing). Have someone watch you.
+local PC = {
+    On = false,
+    Speed = 20,      -- how hard to fast-forward the parry track
+    Zero = true,     -- also zero the blend weight
+    Hits = 0, Seen = false, LastAt = 0,
+}
+GUI.PC = PC
+pcall(function() rawset(_G, "RQPC", PC) end)
+
+local function pcApply(now)
+    local ch = LP.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local an = hum and hum:FindFirstChildOfClass("Animator")
+    if not an then return end
+    local okA, A = pcall(function() return tonumber(an.Address) end)
+    if not (okA and A) then return end
+    local head = rptr(A + OA)
+    if not head or head < 0x10000 then return end
+    local node, guard = rptr(head + ON), 0
+    while node and node > 0x10000 and node ~= head and guard < 64 do
+        guard = guard + 1
+        local t = rptr(node + OT)
+        if t and t > 0x10000 and rptr(t + OO) == A then
+            local id = trackId(t)
+            if id == ANIM_PARRY then
+                if not PC.Seen then
+                    PC.Seen = true
+                    PC.Hits = PC.Hits + 1
+                    PC.LastAt = now
+                end
+                if PC.Zero then
+                    pcall(memory_write, "float", t + OW, 0)
+                    pcall(memory_write, "float", t + OWT, 0)
+                end
+                pcall(memory_write, "float", t + OS, PC.Speed)
+                return
+            end
+        end
+        node = rptr(node + ON)
+    end
+    PC.Seen = false
+end
+
 local function fsApply(now)
     local ch = LP.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -6594,10 +6662,12 @@ task.spawn(function()
             end
             wasK = d
 
-            if FS.On then fsApply(now) end
-            if not FS.On then FS.Phase = "-" end
+            if FS.On then fsApply(now) else FS.Phase = "-" end
+            -- Runs independently of Fast Swing and of Auto Parry, so it also covers parries you
+            -- press yourself. The window is short, so it needs the fast cadence to catch it.
+            if PC.On then pcApply(now) end
         end)
-        task.wait(FS.On and 1 / 200 or 1 / 30)
+        task.wait((FS.On or PC.On) and 1 / 200 or 1 / 30)
     end
 end)
 
@@ -6685,7 +6755,8 @@ task.spawn(function()
             -- stunned, and did I just swing (PARRY_LOCKOUT_AFTER_SWING_END_SECONDS).
             local blocked, parrying = false, false
             if myA then
-                local sid = scan(myA, PARRY_ONLY)
+                -- weight-insensitive: Parry Cancel may have zeroed this track's blend
+                local sid = scan(myA, PARRY_ONLY, true)
                 if sid then parrying = true end
                 if not sid then
                     if scan(myA, STUNS) then blocked = true end
@@ -8001,6 +8072,29 @@ end)()
             secFS:Slider("Slash Time", FS.Slash, 0.01, 0.05, 1, "s", function(v)
                 FS.Slash = tonumber(v) or 0.35
             end):Tooltip("animation time still treated as the slash rather than the recovery tail")
+        end
+
+        -- ---- experimental, its own panel ----
+        local PC = GUI.PC
+        if PC then
+            local secPC = tab:Section("Parry Cancel (Test)", "Left", "Hide the parry animation")
+            GUI._uiPC = secPC:Toggle("Parry Cancel", PC.On, function(v) PC.On = v end)
+            pcall(function() GUI._uiPC:Tooltip("suppress the raised-blades pose while still parrying — EXPERIMENTAL") end)
+            secPC:Toggle("Zero Blend", PC.Zero, function(v) PC.Zero = v end)
+            secPC:Slider("Cancel Speed", PC.Speed, 1, 1, 60, "x", function(v)
+                PC.Speed = tonumber(v) or 20
+            end):Tooltip("fast-forwards the parry animation so it ends instantly. Higher = shorter")
+            pcall(function()
+                secPC:Label(function()
+                    return string.format("Caught %d parr%s", PC.Hits or 0, (PC.Hits == 1) and "y" or "ies")
+                end)
+            end)
+            pcall(function()
+                secPC:Label(function()
+                    if not PC.On then return "Status:  off" end
+                    return PC.Seen and "Status:  cancelling now" or "Status:  armed"
+                end)
+            end)
         end
 
         local secInfo = tab:Section("Status", "Right", "Live")
