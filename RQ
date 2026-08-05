@@ -6147,6 +6147,14 @@ local C_SWING_LOCKOUT = 0.1
 
 -- AnimationTrack memory layout (validated live on this build)
 local OA, ON, OT, OO, OM, OS, OP, OI = 2944, 0, 16, 264, 184, 212, 216, 192
+-- Track WEIGHT (+220) and WEIGHT TARGET (+224). These are the liveness discriminator and they are
+-- load-bearing: Roblox leaves an AnimationTrack in the Animator's active list AFTER it stops, so
+-- "the swing animation is present" does NOT mean "they are swinging". Measured live on two enemies:
+--   playing swing -> TimePosition advancing, 220=1.000, 224=1.000
+--   finished swing -> TimePosition frozen,   220=0.000, 224=0.000   (lingered for 21-25 SECONDS)
+-- Without this gate the script tracks a dead swing and fires when the attacker merely walks past
+-- with their blade out — which is exactly the "slashes near me then leaves" bait.
+local OW, OWT = 220, 224
 
 -- STRICT allowlist. 82 of the 93 ids in Common.Animations.Gear are harmless, and the worst
 -- look-alikes (Grapples.Double, Dashes, Launches) play exactly during a closing approach — so
@@ -6190,6 +6198,9 @@ local AP = {
     Status = "off", Near = 0,
 }
 GUI.AP = AP
+-- Also publish on _G: getgenv() returns nil under Matcha, so GUI is otherwise unreachable from
+-- outside the chunk and the feature cannot be inspected live while debugging.
+pcall(function() rawset(_G, "RQAP", AP) end)
 
 local function rptr(a) local ok, v = pcall(memory_read, "uintptr", a) return ok and v or nil end
 local function rflt(a) local ok, v = pcall(memory_read, "float", a) return ok and v or nil end
@@ -6242,7 +6253,14 @@ local function scan(A, want)
         local t = rptr(node + OT)
         if t and t > 0x10000 and rptr(t + OO) == A then
             local id = trackId(t)
-            if id and want[id] then return id, t, (rflt(t + OP) or 0) end
+            if id and want[id] then
+                -- liveness: only a track that is actually blended in counts
+                local wt = rflt(t + OWT)
+                local w = rflt(t + OW)
+                if wt and w and wt > 0.5 and w > 0.05 then
+                    return id, t, (rflt(t + OP) or 0)
+                end
+            end
         end
         node = rptr(node + ON)
     end
@@ -6403,6 +6421,15 @@ task.spawn(function()
             local now = os.clock()
             hzN = hzN + 1
             if now - hzT >= 1 then AP.Hz = hzN / (now - hzT); hzN, hzT = 0, now end
+            -- Measured tick period drives the commit lead. Sleep is the dominant latency here:
+            -- task.wait(1/120) actually costs 10.2ms on this build (98Hz), and we need two samples
+            -- to differentiate the blade, so a fixed 0.12s lead left almost no margin once input
+            -- and network delay were added. That is the "parries late" case.
+            if AP.LastTick then
+                local d = now - AP.LastTick
+                if d > 0 and d < 0.25 then AP.Dt = (AP.Dt or d) * 0.9 + d * 0.1 end
+            end
+            AP.LastTick = now
 
             -- toggle hotkey, with the release-arm guard: Matcha's iskeypressed can report a key
             -- permanently HELD, which would otherwise flip the feature on the very first frame.
@@ -6423,7 +6450,9 @@ task.spawn(function()
                 AP.Armed = 0
             end
 
-            if not AP.On then AP.Status = "off"; return end
+            -- cleared every tick: an early return below must not leave the loop sprinting
+            AP.Active = false
+            if not AP.On then AP.Status = "off"; AP.Near = 0; return end
 
             local ch = LP.Character
             local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -6556,7 +6585,13 @@ task.spawn(function()
 
             -- COMMIT. bestT is seconds until their blade sweep reaches my body. Press just before
             -- it lands; one press per swing track, and never faster than 0.3s apart.
-            if bestE and not blocked and bestT <= 0.12 and (now - AP.LastPress) > 0.3 then
+            -- Commit lead = fixed input+network allowance + a few measured ticks of detection lag.
+            -- Pressing early is cheap (the parry stays active ~1s); pressing late is a free hit.
+            local lead = 0.055 + 3 * (AP.Dt or 0.01)
+            if lead > 0.30 then lead = 0.30 end
+            AP.Lead = lead
+            AP.Active = (bestE ~= nil)
+            if bestE and not blocked and bestT <= lead and (now - AP.LastPress) > 0.3 then
                 if AP.CoolUntil and now < AP.CoolUntil then AP.ProbeAt = now end
                 press()
                 -- one press per swing track: without this the commit predicate stays true for many
@@ -6585,7 +6620,17 @@ task.spawn(function()
             pcall(keyrelease, AP.Key)
             AP.Armed = 0
         end
-        task.wait(1 / 120)
+        -- ADAPTIVE RATE. Measured on this build: task.wait() costs 0.28ms (~3600Hz) while
+        -- task.wait(1/120) actually costs 10.2ms (~98Hz). Sleeping 10ms per tick was the single
+        -- largest source of "parries late". So we sprint only while a swing is actually in flight
+        -- — a fraction of a second at a time — and idle cheaply the rest of the time.
+        if AP.Active then
+            task.wait()             -- ~3600Hz ceiling; real rate is set by the work below it
+        elseif (AP.Near or 0) > 0 then
+            task.wait(1 / 120)      -- someone nearby: stay responsive enough to catch a swing start
+        else
+            task.wait(1 / 60)       -- nobody near: cheap
+        end
     end
     pcall(keyrelease, AP.Key)
 end)
@@ -7617,7 +7662,8 @@ end)()
         pcall(function()
             secInfo:Label(function()
                 local hz = math.floor((AP.Hz or 0) + 0.5)
-                return string.format("Loop %d Hz   tracking %d   errors %d", hz, AP.Near or 0, AP.Err or 0)
+                return string.format("Loop %d Hz   lead %.0fms   near %d   err %d",
+                    hz, (AP.Lead or 0) * 1000, AP.Near or 0, AP.Err or 0)
             end)
         end)
         secInfo:Button("Reset Learned Values", function()
