@@ -6256,6 +6256,28 @@ local function trackId(t)
     return id
 end
 
+-- Second half of the liveness test: is TimePosition actually ADVANCING?
+-- Weight alone is not enough — measured live, a swing track sat at FULL weight for 24.6 seconds
+-- with its TimePosition frozen. Tracking that as a live swing is the stale-swing bait all over
+-- again. A frozen track is also exactly what onHoldBasicBladeSwing produces when someone holds a
+-- charge, which must never be committed to.
+-- The 0.15s grace matters: we sample far faster than the animation updates (render rate), so most
+-- individual samples legitimately show no change.
+local TPW = {}
+local TPWn = 0
+local function advancing(t, tp, now)
+    local r = TPW[t]
+    if not r then
+        TPW[t] = { tp, now }
+        TPWn = TPWn + 1
+        if TPWn > 400 then TPW = {}; TPWn = 0 end   -- bounded; pointers get recycled anyway
+        return true
+    end
+    if tp > r[1] + 0.0005 then r[1] = tp; r[2] = now; return true end
+    if tp < r[1] - 0.05 then r[1] = tp; r[2] = now; return true end   -- looped/restarted
+    return (now - r[2]) < 0.15
+end
+
 -- One walk, one pass: returns the first id found from `want`, plus its track pointer and TimePosition.
 -- The owner check is load-bearing: foreign tracks genuinely appear in this list.
 local function scan(A, want)
@@ -6272,7 +6294,10 @@ local function scan(A, want)
                 local wt = rflt(t + OWT)
                 local w = rflt(t + OW)
                 if wt and w and wt > 0.5 and w > 0.05 then
-                    return id, t, (rflt(t + OP) or 0)
+                    local tp = rflt(t + OP) or 0
+                    if advancing(t, tp, os.clock()) then
+                        return id, t, tp
+                    end
                 end
             end
         end
@@ -6303,6 +6328,27 @@ local function closest(px, py, pz, vx, vy, vz, tmax)
     if t < 0 then t = 0 elseif t > tmax then t = tmax end
     local dx, dy, dz = px + vx * t, py + vy * t, pz + vz * t
     return math.sqrt(dx * dx + dy * dy + dz * dz), t
+end
+
+-- Same question but under CONSTANT ACCELERATION, solved by sampling instead of a closed form.
+-- Why: at 200ms ping we are forced to predict 100-150ms ahead, and when BOTH players are grappling
+-- a straight-line extrapolation is badly wrong — a grapple reel accelerates hard, and the error
+-- scales with both players' speed. That is the mutual-movement case. Returns the FIRST time the
+-- separation drops inside `thresh` (not the global minimum), because we want to guard the moment
+-- contact becomes possible, not the deepest point of the pass.
+local function firstContact(px, py, pz, vx, vy, vz, ax, ay, az, thresh, horizon)
+    local bestD, bestT = 1000000000, nil
+    for i = 0, 12 do
+        local t = horizon * i / 12
+        local h = 0.5 * t * t
+        local qx = px + vx * t + ax * h
+        local qy = py + vy * t + ay * h
+        local qz = pz + vz * t + az * h
+        local d = math.sqrt(qx * qx + qy * qy + qz * qz)
+        if d <= thresh then return t, d end
+        if d < bestD then bestD = d; bestT = t end
+    end
+    return nil, bestD, bestT
 end
 
 -- Roster: plain strings/numbers only. Matcha returns a distinct shim per access, so a shim can
@@ -6487,6 +6533,27 @@ task.spawn(function()
             pcall(function() myPos = hrp.Position; myVel = hrp.AssemblyLinearVelocity end)
             if not (myPos and myVel) then return end
 
+            -- MY acceleration. Needed because when we are BOTH grappling, the thing that has to be
+            -- predicted is RELATIVE motion, and both halves of it are accelerating hard. Sampled on
+            -- a ~50Hz baseline and smoothed, since frame-to-frame acceleration is very noisy.
+            local mAx, mAy, mAz = 0, 0, 0
+            if AP.pmv and AP.pmvT then
+                local d = now - AP.pmvT
+                if d > 0.02 and d < 0.3 then
+                    mAx = (myVel.X - AP.pmv[1]) / d
+                    mAy = (myVel.Y - AP.pmv[2]) / d
+                    mAz = (myVel.Z - AP.pmv[3]) / d
+                    AP.pmv = { myVel.X, myVel.Y, myVel.Z }
+                    AP.pmvT = now
+                    AP.ax = (AP.ax or 0) * 0.7 + mAx * 0.3
+                    AP.ay = (AP.ay or 0) * 0.7 + mAy * 0.3
+                    AP.az = (AP.az or 0) * 0.7 + mAz * 0.3
+                end
+            else
+                AP.pmv = { myVel.X, myVel.Y, myVel.Z }
+                AP.pmvT = now
+            end
+
             local an = hum:FindFirstChildOfClass("Animator")
             local myA = nil
             if an then local o, a = pcall(function() return tonumber(an.Address) end); myA = o and a or nil end
@@ -6591,6 +6658,20 @@ task.spawn(function()
                             local evel
                             pcall(function() evel = e.hrp.AssemblyLinearVelocity end)
                             if evel then
+                                -- their acceleration, same treatment as ours
+                                if e.pv and e.pvT then
+                                    local pd2 = now - e.pvT
+                                    if pd2 > 0.02 and pd2 < 0.3 then
+                                        e.ax = (e.ax or 0) * 0.7 + ((evel.X - e.pv[1]) / pd2) * 0.3
+                                        e.ay = (e.ay or 0) * 0.7 + ((evel.Y - e.pv[2]) / pd2) * 0.3
+                                        e.az = (e.az or 0) * 0.7 + ((evel.Z - e.pv[3]) / pd2) * 0.3
+                                        e.pv = { evel.X, evel.Y, evel.Z }
+                                        e.pvT = now
+                                    end
+                                else
+                                    e.pv = { evel.X, evel.Y, evel.Z }
+                                    e.pvT = now
+                                end
                                 local vdx = evel.X - myVel.X
                                 local vdy = evel.Y - myVel.Y
                                 local vdz = evel.Z - myVel.Z
@@ -6611,19 +6692,13 @@ task.spawn(function()
                                     -- at 300 studs/s that is ~5 extra studs per frame. This is the
                                     -- mechanism behind "he hit me from further than he should".
                                     local reach = (e.span or 6.5) + AP.BodyR + closing * (1 / 60)
-                                    local qa = vdx * vdx + vdy * vdy + vdz * vdz
-                                    local qb = 2 * (dx * vdx + dy * vdy + dz * vdz)
-                                    local qc = d3 * d3 - reach * reach
-                                    local tHit = nil
-                                    if qc <= 0 then
-                                        tHit = 0                      -- already inside reach
-                                    elseif qa > 0.000001 then
-                                        local disc = qb * qb - 4 * qa * qc
-                                        if disc >= 0 then
-                                            local r = (-qb - math.sqrt(disc)) / (2 * qa)
-                                            if r >= 0 then tHit = r end
-                                        end
-                                    end
+                                    -- RELATIVE acceleration: this is the term that was missing, and
+                                    -- it is exactly what makes a mutual grapple fight different from
+                                    -- a one-sided approach.
+                                    local rax = (e.ax or 0) - (AP.ax or 0)
+                                    local ray = (e.ay or 0) - (AP.ay or 0)
+                                    local raz = (e.az or 0) - (AP.az or 0)
+                                    local tHit = firstContact(dx, dy, dz, vdx, vdy, vdz, rax, ray, raz, reach, 0.8)
                                     if tHit and tHit < bestT then
                                         bestT = tHit
                                         bestE = e
@@ -6674,13 +6749,20 @@ task.spawn(function()
                                             -- 0.8s horizon, not 0.45: a swing thrown at 118 studs
                                             -- while closing at 230 studs/s lands ~0.47s later, which
                                             -- the old horizon clipped right at the boundary.
-                                            local pd, pt = closest(bx - myPos.X, by - myPos.Y, bz - myPos.Z,
-                                                rx, ry, rz, 0.8)
                                             local thresh = AP.BodyR
+                                            local rax = (e.ax or 0) - (AP.ax or 0)
+                                            local ray = (e.ay or 0) - (AP.ay or 0)
+                                            local raz = (e.az or 0) - (AP.az or 0)
+                                            local pt = firstContact(bx - myPos.X, by - myPos.Y, bz - myPos.Z,
+                                                rx, ry, rz, rax, ray, raz, thresh, 0.8)
                                             if sd <= thresh then
                                                 if 0 < bestT then bestT = 0; bestE = e; bestD = sd; bestK = key end
-                                            elseif pd <= thresh and pt < bestT then
-                                                bestT = pt; bestE = e; bestD = pd; bestK = key
+                                            elseif pt and pt < bestT then
+                                                bestT = pt; bestE = e; bestD = thresh; bestK = key
+                                                -- relative closing speed of the BLADE, used to size
+                                                -- the commit lead the same way the body path does
+                                                local rs = math.sqrt(rx * rx + ry * ry + rz * rz)
+                                                if rs > bestClose then bestClose = rs end
                                             end
                                         end
                                         rec.x, rec.y, rec.z, rec.t = tpos.X, tpos.Y, tpos.Z, now
