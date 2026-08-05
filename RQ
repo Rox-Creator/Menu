@@ -6575,9 +6575,52 @@ local PC = {
     Blank = false,   -- blank the Animation instance's AnimationId (see note)
     CancelKey = 0,   -- 0 = none
     CancelMs = 80,
+    Override = false,      -- play a borrowed animation over the parry pose (see pcLoadOverride)
+    ovSrc = "idle",        -- which Animate group to borrow the Animation instance from
+    ovTrack = nil, ovErr = "not tried", ovUntil = 0, ovHold = 0.6,
     Hits = 0, Seen = false, LastAt = 0,
     animPtr = nil, origLen = nil, pendAt = 0,
 }
+-- OVERRIDE POSE — the only approach that can replicate, because it is a REAL API call.
+-- Instance.new fails under Matcha, so we cannot build an Animation. But the character already owns
+-- several: Animate.idle.Animation1, walk.WalkAnim, run.RunAnim ... (confirmed live). We borrow one,
+-- Animator:LoadAnimation it once, force its Priority to Action4 and play it over the parry.
+-- Because this goes through the normal animation API rather than a memory poke, Roblox replicates
+-- it, so other players should see the idle pose instead of the raised blades.
+-- Priority must be set as a RAW NUMBER: Matcha strips the Enum table, and AnimationPriority.Action4
+-- is 5 (Idle 0, Movement 1, Action 2, Action2 3, Action3 4, Action4 5, Core 1000).
+local function pcLoadOverride()
+    if PC.ovTrack ~= nil then return PC.ovTrack end
+    local ch = LP.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    local src = nil
+    pcall(function()
+        local a = ch:FindFirstChild("Animate")
+        local g = a and a:FindFirstChild(PC.ovSrc or "idle")
+        if g then
+            for _, k in ipairs(g:GetChildren()) do
+                if tostring(k.ClassName) == "Animation" then src = k break end
+            end
+        end
+    end)
+    if not (animator and src) then
+        PC.ovErr = "no Animate source"
+        return nil
+    end
+    local ok, tr = pcall(function() return animator:LoadAnimation(src) end)
+    if not (ok and tr) then
+        PC.ovTrack = false
+        PC.ovErr = "LoadAnimation unavailable"
+        return nil
+    end
+    pcall(function() tr.Priority = 5 end)      -- Action4
+    pcall(function() tr.Looped = true end)
+    PC.ovTrack = tr
+    PC.ovErr = "ready"
+    return tr
+end
+
 -- Put the AnimationId string back exactly as it was. Called whenever the option is switched off.
 local function pcRestore()
     if PC.animPtr and PC.origLen then
@@ -6613,6 +6656,19 @@ local function pcApply(now)
                     -- a timestamp the loop checks rather than a real timer)
                     if PC.CancelKey and PC.CancelKey > 0 then
                         PC.pendAt = now + (PC.CancelMs or 80) / 1000
+                    end
+                    if PC.Override then
+                        local tr = pcLoadOverride()
+                        if tr then
+                            local ok = pcall(function() tr:Play(0, 1, 1) end)
+                            if ok then
+                                PC.ovUntil = now + (PC.ovHold or 0.6)
+                                PC.ovErr = "playing"
+                            else
+                                PC.ovErr = "Play failed"
+                                PC.ovTrack = nil   -- force a reload (character may have respawned)
+                            end
+                        end
                     end
                 end
                 if PC.Zero then
@@ -6716,6 +6772,14 @@ task.spawn(function()
             -- press yourself. The window is short, so it needs the fast cadence to catch it.
             if PC.On then
                 pcApply(now)
+                -- stop the override once the parry pose is over, or it would pin you in the idle
+                -- pose at Action4 and freeze your movement animations
+                if PC.ovUntil > 0 and now >= PC.ovUntil then
+                    PC.ovUntil = 0
+                    local tr = PC.ovTrack
+                    if tr then pcall(function() tr:Stop(0) end) end
+                    if PC.ovErr == "playing" then PC.ovErr = "ready" end
+                end
                 -- fire the input-based cancel once its delay has elapsed
                 if PC.pendAt > 0 and now >= PC.pendAt then
                     PC.pendAt = 0
@@ -6728,8 +6792,13 @@ task.spawn(function()
                         end)
                     end
                 end
-            elseif PC.animPtr then
+            elseif PC.animPtr or PC.ovUntil > 0 then
                 pcRestore()
+                if PC.ovUntil > 0 then
+                    PC.ovUntil = 0
+                    local tr = PC.ovTrack
+                    if tr then pcall(function() tr:Stop(0) end) end
+                end
             end
         end)
         task.wait((FS.On or PC.On) and 1 / 200 or 1 / 30)
@@ -8162,6 +8231,17 @@ end)()
             secPC:Slider("Cancel Delay", PC.CancelMs, 5, 20, 400, " ms", function(v)
                 PC.CancelMs = tonumber(v) or 80
             end):Tooltip("how long after the parry the cancel key is pressed")
+            secPC:Toggle("Override Pose", PC.Override, function(v)
+                PC.Override = v
+                PC.ovTrack = nil
+                PC.ovErr = "not tried"
+            end):Tooltip("borrow an idle animation and play it OVER the parry at Action4 priority. A real API call, so unlike the memory writes this should replicate")
+            secPC:Slider("Override Hold", math.floor((PC.ovHold or 0.6) * 1000), 50, 200, 1500, " ms", function(v)
+                PC.ovHold = (tonumber(v) or 600) / 1000
+            end):Tooltip("how long the override plays before releasing you back to normal animations")
+            pcall(function()
+                secPC:Label(function() return "Override:  " .. tostring(PC.ovErr or "-") end)
+            end)
             pcall(function()
                 secPC:Label(function()
                     return string.format("Caught %d parr%s", PC.Hits or 0, (PC.Hits == 1) and "y" or "ies")
