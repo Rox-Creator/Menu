@@ -6510,7 +6510,10 @@ local FS = {
     Key = 0x48,        -- H
     Swing = 1.0,       -- playback rate for the active slash / windup boost
     Recovery = 8.0,    -- playback rate for the recovery tail
-    Windup = 0.36,     -- how much of the animation the charge boost covers before hands-off
+    -- How much of the animation the charge boost covers before going hands-off. Fixed rather than
+    -- exposed: it only shapes the brief windup boost while M1 is HELD, and the value that matters
+    -- is that it ends early enough for the game to park the charge at its own keyframe.
+    Windup = 0.36,
     Slash = 0.35,      -- animation time that still counts as the slash rather than the tail
     M1 = false, M1At = 0, Phase = "-", Hz = 0,
 }
@@ -7995,9 +7998,6 @@ end)()
             secFS:Slider("Recovery Speed", FS.Recovery, 0.5, 1, 30, "x", function(v)
                 FS.Recovery = tonumber(v) or 8
             end):Tooltip("how fast the recovery tail is skipped — this is what makes you actionable again sooner")
-            secFS:Slider("Charge Windup", FS.Windup, 0.01, 0.05, 1.5, "", function(v)
-                FS.Windup = tonumber(v) or 0.36
-            end):Tooltip("how much of the animation the charge boost covers before going hands-off")
             secFS:Slider("Slash Time", FS.Slash, 0.01, 0.05, 1, "s", function(v)
                 FS.Slash = tonumber(v) or 0.35
             end):Tooltip("animation time still treated as the slash rather than the recovery tail")
