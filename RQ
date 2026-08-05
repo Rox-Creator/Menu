@@ -6293,11 +6293,7 @@ end
 
 -- One walk, one pass: returns the first id found from `want`, plus its track pointer and TimePosition.
 -- The owner check is load-bearing: foreign tracks genuinely appear in this list.
--- `ignoreWeight` exists for one caller: confirming OUR OWN parry. Parry Cancel deliberately zeroes
--- that track's blend weight, which would otherwise make our own parry invisible to the confirmation
--- logic and leave the cooldown model permanently wrong. The advancing() check still guards against
--- a stale track, so dropping the weight requirement here is safe.
-local function scan(A, want, ignoreWeight)
+local function scan(A, want)
     local head = rptr(A + OA)
     if not head or head < 0x10000 then return nil end
     local node, guard = rptr(head + ON), 0
@@ -6308,13 +6304,9 @@ local function scan(A, want, ignoreWeight)
             local id = trackId(t)
             if id and want[id] then
                 -- liveness: only a track that is actually blended in counts
-                local live = true
-                if not ignoreWeight then
-                    local wt = rflt(t + OWT)
-                    local w = rflt(t + OW)
-                    live = (wt and w and wt > 0.5 and w > 0.05) and true or false
-                end
-                if live then
+                local wt = rflt(t + OWT)
+                local w = rflt(t + OW)
+                if wt and w and wt > 0.5 and w > 0.05 then
                     local tp = rflt(t + OP) or 0
                     if advancing(t, tp, os.clock()) then
                         return id, t, tp
@@ -6535,171 +6527,6 @@ for id in pairs(SWINGS) do FS_SWINGS[id] = true end
 for _, id in ipairs({ "112666168396669", "86140055867484", "124361532701064", "136621055776523",
                       "82666636655771", "75659520618730", "89635808450635" }) do FS_SWINGS[id] = true end
 
--- ============================================================
--- PARRY CANCEL (TEST)  —  suppress the parry animation, keep the parry
--- ============================================================
--- The parry OUTCOME is decided server-side from the keybind press (Gear.Parry arrives as a RESULT
--- event), and nothing in the recovered Blades.Default logic keys the parry off its own animation
--- keyframes — the windows are plain time constants. So the raised-blades pose should be purely
--- cosmetic, and killing it ought to leave the parry itself intact.
---
--- Two independent kills, because it is not knowable from this side which one replicates:
---   Zero Blend    — weight and weight-target to 0, so the pose contributes nothing to the rig
---   Cancel Speed  — fast-forward the track so it burns to its end almost immediately
---
--- HONEST LIMIT: whether OTHER players still see the animation cannot be determined from this
--- client. Roblox replicates animation state from the owning client, but these are raw memory
--- writes, which may bypass whatever notifies the replicator. If it turns out only the local view
--- is suppressed, that is the mechanism to blame, and the fix would have to come from the API side
--- (which Matcha does not expose — GetPlayingAnimationTracks is missing). Have someone watch you.
--- CONFIRMED BY TESTING: Zero Blend and Cancel Speed hide the pose LOCALLY ONLY. Other players
--- still see it, because Roblox replicates the animation from the client's original Play() call and
--- raw memory writes never notify the replicator. Matcha has no hookfunction, no signal firing and
--- no instance-from-address, so the clean fixes are unavailable. Two further options below:
---
---   Blank Anim ID  — zero the LENGTH field of the Animation instance's AnimationId string, so the
---                    object points at nothing. Reversible (the original length is restored). This
---                    only takes effect from the NEXT parry onward, since the instance is reused —
---                    which makes it falsifiable: if parry #1 still shows to others and #2 onward
---                    do not, the mechanism works. If the engine cached the resolved asset at
---                    LoadAnimation time (likely), it will change nothing. Honest odds: low.
---
---   Cancel Key     — the one approach that definitely replicates, because the GAME performs it:
---                    press another action shortly after the parry so its animation overrides the
---                    parry pose. This is what an animation cancel actually is. It replicates
---                    properly, at the cost of performing that action.
-local PC = {
-    On = false,
-    Speed = 20,      -- how hard to fast-forward the parry track
-    Zero = true,     -- also zero the blend weight
-    Blank = false,   -- blank the Animation instance's AnimationId (see note)
-    CancelKey = 0,   -- 0 = none
-    CancelMs = 80,
-    Override = false,      -- play a borrowed animation over the parry pose (see pcLoadOverride)
-    ovSrc = "idle",        -- which Animate group to borrow the Animation instance from
-    ovTrack = nil, ovErr = "not tried", ovUntil = 0, ovHold = 0.6,
-    Hits = 0, Seen = false, LastAt = 0,
-    animPtr = nil, origLen = nil, pendAt = 0,
-}
--- OVERRIDE POSE — the only approach that can replicate, because it is a REAL API call.
--- Instance.new fails under Matcha, so we cannot build an Animation. But the character already owns
--- several: Animate.idle.Animation1, walk.WalkAnim, run.RunAnim ... (confirmed live). We borrow one,
--- Animator:LoadAnimation it once, force its Priority to Action4 and play it over the parry.
--- Because this goes through the normal animation API rather than a memory poke, Roblox replicates
--- it, so other players should see the idle pose instead of the raised blades.
--- Priority must be set as a RAW NUMBER: Matcha strips the Enum table, and AnimationPriority.Action4
--- is 5 (Idle 0, Movement 1, Action 2, Action2 3, Action3 4, Action4 5, Core 1000).
-local function pcLoadOverride()
-    if PC.ovTrack ~= nil then return PC.ovTrack end
-    local ch = LP.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    local src = nil
-    pcall(function()
-        local a = ch:FindFirstChild("Animate")
-        local g = a and a:FindFirstChild(PC.ovSrc or "idle")
-        if g then
-            for _, k in ipairs(g:GetChildren()) do
-                if tostring(k.ClassName) == "Animation" then src = k break end
-            end
-        end
-    end)
-    if not (animator and src) then
-        PC.ovErr = "no Animate source"
-        return nil
-    end
-    local ok, tr = pcall(function() return animator:LoadAnimation(src) end)
-    if not (ok and tr) then
-        PC.ovTrack = false
-        PC.ovErr = "LoadAnimation unavailable"
-        return nil
-    end
-    pcall(function() tr.Priority = 5 end)      -- Action4
-    pcall(function() tr.Looped = true end)
-    PC.ovTrack = tr
-    PC.ovErr = "ready"
-    return tr
-end
-
--- Put the AnimationId string back exactly as it was. Called whenever the option is switched off.
-local function pcRestore()
-    if PC.animPtr and PC.origLen then
-        pcall(memory_write, "uintptr", PC.animPtr + 16, PC.origLen)
-    end
-    PC.animPtr, PC.origLen = nil, nil
-end
-GUI.PCRestore = pcRestore
-GUI.PC = PC
-pcall(function() rawset(_G, "RQPC", PC) end)
-
-local function pcApply(now)
-    local ch = LP.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local an = hum and hum:FindFirstChildOfClass("Animator")
-    if not an then return end
-    local okA, A = pcall(function() return tonumber(an.Address) end)
-    if not (okA and A) then return end
-    local head = rptr(A + OA)
-    if not head or head < 0x10000 then return end
-    local node, guard = rptr(head + ON), 0
-    while node and node > 0x10000 and node ~= head and guard < 64 do
-        guard = guard + 1
-        local t = rptr(node + OT)
-        if t and t > 0x10000 and rptr(t + OO) == A then
-            local id = trackId(t)
-            if id == ANIM_PARRY then
-                if not PC.Seen then
-                    PC.Seen = true
-                    PC.Hits = PC.Hits + 1
-                    PC.LastAt = now
-                    -- schedule the input-based cancel (task.delay is a no-op in Matcha, so this is
-                    -- a timestamp the loop checks rather than a real timer)
-                    if PC.CancelKey and PC.CancelKey > 0 then
-                        PC.pendAt = now + (PC.CancelMs or 80) / 1000
-                    end
-                    if PC.Override then
-                        local tr = pcLoadOverride()
-                        if tr then
-                            local ok = pcall(function() tr:Play(0, 1, 1) end)
-                            if ok then
-                                PC.ovUntil = now + (PC.ovHold or 0.6)
-                                PC.ovErr = "playing"
-                            else
-                                PC.ovErr = "Play failed"
-                                PC.ovTrack = nil   -- force a reload (character may have respawned)
-                            end
-                        end
-                    end
-                end
-                if PC.Zero then
-                    pcall(memory_write, "float", t + OW, 0)
-                    pcall(memory_write, "float", t + OWT, 0)
-                end
-                pcall(memory_write, "float", t + OS, PC.Speed)
-                if PC.Blank then
-                    -- Zeroing just the LENGTH leaves the heap buffer untouched, so this is a
-                    -- one-word, fully reversible edit rather than rewriting a Roblox string.
-                    local ap = rptr(t + OM)
-                    if ap and ap > 0x10000 then
-                        local base = ap + OI
-                        if PC.animPtr ~= base then
-                            local L = rptr(base + 16)
-                            if L and L > 0 and L < 256 then
-                                pcRestore()
-                                PC.animPtr, PC.origLen = base, L
-                                pcall(memory_write, "uintptr", base + 16, 0)
-                            end
-                        end
-                    end
-                end
-                return
-            end
-        end
-        node = rptr(node + ON)
-    end
-    PC.Seen = false
-end
-
 local function fsApply(now)
     local ch = LP.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -6768,40 +6595,8 @@ task.spawn(function()
             wasK = d
 
             if FS.On then fsApply(now) else FS.Phase = "-" end
-            -- Runs independently of Fast Swing and of Auto Parry, so it also covers parries you
-            -- press yourself. The window is short, so it needs the fast cadence to catch it.
-            if PC.On then
-                pcApply(now)
-                -- stop the override once the parry pose is over, or it would pin you in the idle
-                -- pose at Action4 and freeze your movement animations
-                if PC.ovUntil > 0 and now >= PC.ovUntil then
-                    PC.ovUntil = 0
-                    local tr = PC.ovTrack
-                    if tr then pcall(function() tr:Stop(0) end) end
-                    if PC.ovErr == "playing" then PC.ovErr = "ready" end
-                end
-                -- fire the input-based cancel once its delay has elapsed
-                if PC.pendAt > 0 and now >= PC.pendAt then
-                    PC.pendAt = 0
-                    local ck = PC.CancelKey
-                    if ck and ck > 0 then
-                        task.spawn(function()
-                            pcall(keypress, ck)
-                            task.wait(0.03)
-                            pcall(keyrelease, ck)
-                        end)
-                    end
-                end
-            elseif PC.animPtr or PC.ovUntil > 0 then
-                pcRestore()
-                if PC.ovUntil > 0 then
-                    PC.ovUntil = 0
-                    local tr = PC.ovTrack
-                    if tr then pcall(function() tr:Stop(0) end) end
-                end
-            end
         end)
-        task.wait((FS.On or PC.On) and 1 / 200 or 1 / 30)
+        task.wait(FS.On and 1 / 200 or 1 / 30)
     end
 end)
 
@@ -6889,8 +6684,7 @@ task.spawn(function()
             -- stunned, and did I just swing (PARRY_LOCKOUT_AFTER_SWING_END_SECONDS).
             local blocked, parrying = false, false
             if myA then
-                -- weight-insensitive: Parry Cancel may have zeroed this track's blend
-                local sid = scan(myA, PARRY_ONLY, true)
+                local sid = scan(myA, PARRY_ONLY)
                 if sid then parrying = true end
                 if not sid then
                     if scan(myA, STUNS) then blocked = true end
@@ -8206,53 +8000,6 @@ end)()
             secFS:Slider("Slash Time", FS.Slash, 0.01, 0.05, 1, "s", function(v)
                 FS.Slash = tonumber(v) or 0.35
             end):Tooltip("animation time still treated as the slash rather than the recovery tail")
-        end
-
-        -- ---- experimental, its own panel ----
-        local PC = GUI.PC
-        if PC then
-            local secPC = tab:Section("Parry Cancel (Test)", "Left", "Hide the parry animation")
-            GUI._uiPC = secPC:Toggle("Parry Cancel", PC.On, function(v) PC.On = v end)
-            pcall(function() GUI._uiPC:Tooltip("suppress the raised-blades pose while still parrying — EXPERIMENTAL") end)
-            secPC:Toggle("Zero Blend", PC.Zero, function(v) PC.Zero = v end)
-            secPC:Slider("Cancel Speed", PC.Speed, 1, 1, 60, "x", function(v)
-                PC.Speed = tonumber(v) or 20
-            end):Tooltip("fast-forwards the parry animation so it ends instantly. Higher = shorter")
-            secPC:Toggle("Blank Anim ID", PC.Blank, function(v)
-                PC.Blank = v
-                if not v then pcall(function() if GUI.PCRestore then GUI.PCRestore() end end) end
-            end):Tooltip("long shot: points the Animation object at nothing. Only affects the NEXT parry onward, so if #1 shows to others and #2+ don't, it worked")
-            pcall(function()
-                secPC:Keybind("Cancel Key", toName(PC.CancelKey or 0), function(k)
-                    local vk = toVK(k)
-                    PC.CancelKey = vk or 0
-                end, "the only approach that truly replicates: press another action right after the parry so ITS animation overrides the pose")
-            end)
-            secPC:Slider("Cancel Delay", PC.CancelMs, 5, 20, 400, " ms", function(v)
-                PC.CancelMs = tonumber(v) or 80
-            end):Tooltip("how long after the parry the cancel key is pressed")
-            secPC:Toggle("Override Pose", PC.Override, function(v)
-                PC.Override = v
-                PC.ovTrack = nil
-                PC.ovErr = "not tried"
-            end):Tooltip("borrow an idle animation and play it OVER the parry at Action4 priority. A real API call, so unlike the memory writes this should replicate")
-            secPC:Slider("Override Hold", math.floor((PC.ovHold or 0.6) * 1000), 50, 200, 1500, " ms", function(v)
-                PC.ovHold = (tonumber(v) or 600) / 1000
-            end):Tooltip("how long the override plays before releasing you back to normal animations")
-            pcall(function()
-                secPC:Label(function() return "Override:  " .. tostring(PC.ovErr or "-") end)
-            end)
-            pcall(function()
-                secPC:Label(function()
-                    return string.format("Caught %d parr%s", PC.Hits or 0, (PC.Hits == 1) and "y" or "ies")
-                end)
-            end)
-            pcall(function()
-                secPC:Label(function()
-                    if not PC.On then return "Status:  off" end
-                    return PC.Seen and "Status:  cancelling now" or "Status:  armed"
-                end)
-            end)
         end
 
         local secInfo = tab:Section("Status", "Right", "Live")
