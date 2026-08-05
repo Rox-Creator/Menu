@@ -19,6 +19,12 @@ local CONFIG_PATH      = CONFIG_DIR .. "/RQConfig.json"
 local RS_SNAPSHOT_PATH = CONFIG_DIR .. "/rs_snapshot.json"
 
 local GUI = {}
+-- ============================================================
+-- SCRIPT VERSION — bump this on EVERY published change.
+-- Single source of truth: it renders as the badge beside the menu title, so there is exactly one
+-- place to edit. Format vMAJOR.MINOR; minor for normal changes, major for a rework.
+-- ============================================================
+GUI.Version = "v2.0"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7108,7 +7114,7 @@ end)()
         title     = "Requiem",
         subtitle  = "Bro you don't go 290 velo",
         size      = Vector2.new(640, 580),
-        badge     = "v2",
+        badge     = GUI.Version,
         menuKey   = "f3",        -- F3 toggles the menu (matches the old bind)
         gameInput = "always",    -- never eat movement keys
     })
@@ -8014,9 +8020,6 @@ end)()
             secFS:Slider("Recovery Speed", FS.Recovery, 0.5, 1, 30, "x", function(v)
                 FS.Recovery = tonumber(v) or 8
             end):Tooltip("how fast the recovery tail is skipped — this is what makes you actionable again sooner")
-            secFS:Slider("Slash Time", FS.Slash, 0.01, 0.05, 1, "s", function(v)
-                FS.Slash = tonumber(v) or 0.35
-            end):Tooltip("animation time still treated as the slash rather than the recovery tail")
         end
 
         local secInfo = tab:Section("Status", "Right", "Live")
