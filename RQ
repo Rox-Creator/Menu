@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.6"
+GUI.Version = "v2.7"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7515,6 +7515,15 @@ end)()
     -- and helpers live inside this tab's scope.
     tabBuild(function()
         local tab = window:Tab("Character", "sword")
+        -- Row-locked columns: each Left section opens a ROW at max(both cursors) and the next
+        -- Right section starts level with it, so Grapple/Velocity, Dash/Parry and
+        -- Firearm Auto/Firearm Manual line up exactly. Costs whitespace under the shorter card
+        -- of each pair, which is the trade we want here.
+        -- OPT-IN per tab on purpose: with two Left sections in a row (ESP, Style, Tools) it would
+        -- push the first Right section down to the second Left's row instead of letting it start
+        -- at the top. Only tabs that strictly alternate L,R should turn this on.
+        -- pcall'd because the upstream fallback library has no RowAlign.
+        pcall(function() tab:RowAlign(true) end)
 
         -- key -> { lo, hi = accept range (excludes hash decoys, spans every slider value), fb = default }
         local CFG = {
