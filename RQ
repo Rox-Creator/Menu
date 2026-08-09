@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.4"
+GUI.Version = "v2.5"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -6077,16 +6077,20 @@ local function drawBadge()
     -- scissor band set for everyone after it. Reset all four or the badge silently clips to
     -- nothing — and clipTop without clipBot is a hard error in rect().
     R.fade = op; R.yoff = 0; R.clipTop = nil; R.clipBot = nil
-    local w = maxf(34, floor(tw(ver, 11)) + 18)
+    local fs, h = 11, 18
+    local w = maxf(34, floor(tw(ver, fs)) + 18)
     local x = cx + cw - w
-    local y = cy - 37   -- cy-48 is the top of the band; this centres an 18px pill on the tab title
+    local y = cy - 37   -- cy-48 is the top of the band; this centres the pill on the tab title
     -- 5,000,000 clears the library's real ceiling of 4,659,999 (its modal dialog's button labels,
     -- base 455 through the x10000 helper). 3,000,000 — what drawCharLock above uses — does NOT:
     -- tooltips, the spotlight palette and dialogs all outrank it.
     local Z = 5000000
-    rect(x, y, w, 18, T.red, Z, 0.22, 6)
-    rect(x, y, w, 18, T.red, Z + 1, 0.60, 6, false, 1)     -- explicit thickness: pooled Squares keep the last one
-    txt(ver, x + w / 2, y + 3, 11, T.text, Z + 2, true)    -- label in T.text so a dark custom accent can't hide it
+    rect(x, y, w, h, T.red, Z, 0.22, 6)
+    rect(x, y, w, h, T.red, Z + 1, 0.60, 6, false, 1)      -- explicit thickness: pooled Squares keep the last one
+    -- Centred both ways: Center=true puts the glyphs on the pill's midpoint, and (h-fs)/1.35 is
+    -- the same vertical figure button() uses for its labels — Drawing renders text high in its
+    -- box, so a plain (h-fs)/2 sits visibly above centre.
+    txt(ver, x + w / 2, y + (h - fs) / 1.35, fs, T.text, Z + 2, true)   -- T.text so a dark custom accent can't hide it
     R.fade = 1
 end
 
@@ -7635,7 +7639,9 @@ end)()
         end)
 
         -- ---------- Velocity (ODM speed build-up) ----------
-        local secVe = tab:Section("Velocity", "Right", "ODM speed build-up")
+        -- Left column: this tab is split movement (Grapple / Velocity / Dash) on the left,
+        -- combat (Blades / Firearms / Weapons Manual) on the right, so neither side stacks up.
+        local secVe = tab:Section("Velocity", "Left", "ODM speed build-up")
         local veMax, veInc = CFG.GearMaxVelocityMultiplier.fb, CFG.GearVelocityIncreaseRate.fb
         GUI.VeloMult = veMax   -- feed the Tools "Velocity Indicator" popup
         secVe:Slider("Max Velocity", veMax, 0.01, 0.5, 3, "x", function(v) veMax = tonumber(v) or veMax; GUI.VeloMult = veMax end)
@@ -7738,37 +7744,48 @@ end)()
         local secFire = tab:Section("Firearms", "Right", "Every gun: no spread / no recoil")
         secFire:Label(function() return "Inaccuracy 0 | Recoil 0   (all guns, incl. BlunderBuss)" end)
         local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
-        local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the first zero
+        local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the FIRST write
+        -- Shared by the zero button AND the Weapons Manual sliders below, so whichever you use,
+        -- Restore still puts the PER-GUN originals back. That matters because the stock values
+        -- differ (inaccuracy 2.5 / 7.5 / 8.5 / 15, recoil 2 / 4) and any single written number
+        -- flattens them all — without this snapshot the differences would be gone for good.
+        local function fireWrite(key, value)
+            local safe = entriesFor(key)
+            if #safe == 0 then return false end
+            fireOrig[key] = fireOrig[key] or {}
+            for _, e in ipairs(safe) do
+                local a = tostring(e.addr)
+                if fireOrig[key][a] == nil then fireOrig[key][a] = tonumber(e.value) end
+            end
+            return apply(key, value)
+        end
+        local function fireRestore()
+            for _, key in ipairs(FIRE_KEYS) do
+                local orig = fireOrig[key]
+                if orig then
+                    for _, e in ipairs(entriesFor(key)) do
+                        local o = orig[tostring(e.addr)]
+                        -- 1-entry applygc = that one address only, so each gun gets ITS own value
+                        if o ~= nil then pcall(function() applygc({ e }, key, o) end) end
+                    end
+                end
+            end
+        end
         secFire:Button("Apply Firearms", function()
             if not gateOK() then return end
             task.spawn(function()
                 local okAll = true
                 for _, key in ipairs(FIRE_KEYS) do
-                    local safe = entriesFor(key)
-                    if #safe == 0 then okAll = false end
-                    fireOrig[key] = fireOrig[key] or {}
-                    for _, e in ipairs(safe) do
-                        local a = tostring(e.addr)
-                        if fireOrig[key][a] == nil then fireOrig[key][a] = tonumber(e.value) end
-                    end
-                    if not apply(key, 0) then okAll = false end
+                    if not fireWrite(key, 0) then okAll = false end
                 end
-                notif("Firearms", okAll and "Muskets + Flintlocks: 0 spread / 0 recoil" or "Failed - equip a firearm first", 3)
+                notif("Firearms", okAll and "Every gun: 0 spread / 0 recoil" or "Failed - equip a firearm first", 3)
             end)
         end)
         secFire:Button("Restore Default", function()
             if not gateOK() then return end
             task.spawn(function()
-                for _, key in ipairs(FIRE_KEYS) do
-                    local orig = fireOrig[key]
-                    if orig then
-                        for _, e in ipairs(entriesFor(key)) do
-                            local o = orig[tostring(e.addr)]
-                            if o ~= nil then pcall(function() applygc({ e }, key, o) end) end
-                        end
-                    end
-                end
-                notif("Firearms", "Restored original spread + recoil", 3)
+                fireRestore()
+                notif("Firearms", "Restored each gun's own spread + recoil", 3)
             end)
         end)
 
@@ -7975,19 +7992,46 @@ end)()
             if not quiet then notif("Blunderbuss", bbStatus, okAll and 3 or 5) end
         end
 
-        local secBB = tab:Section("Blunderbuss (Test)", "Right", "BlunderBuss ONLY - other guns untouched")
+        -- ---------- Weapons Manual: tune by hand instead of going all-zero ----------
+        -- Two scopes live in this one section, and the difference is not cosmetic:
+        --   Inaccuracy / Recoil  -> written BY KEY NAME, so they hit EVERY firearm at once
+        --                           (musket, flintlock, blunderbuss, and thunderspears, which
+        --                           shares BASE_INACCURACY_OFFSET at 15). One number replaces all
+        --                           of their different stock values; Restore undoes that per-gun.
+        --   Pellet Spread        -> BlunderBuss ONLY, via the address fingerprint above, because
+        --                           PELLET_SPREAD_OFFSET is shared with the other pellet gun.
+        local wmInacc, wmRecoil = 7.5, 2   -- musket/flintlock stock, the most common of each
+        local secBB = tab:Section("Weapons Manual", "Right", "Hand-tune instead of zeroing")
         secBB:Label(function() return bbStatus end)
+        secBB:Slider("Inaccuracy", wmInacc, 0.1, 0, 15, "",
+            function(v) wmInacc = tonumber(v) or wmInacc end,
+            "Aim-point scatter, for EVERY gun. Stock differs per weapon (2.5 / 7.5 / 8.5, thunderspears 15) and one slider sets them all to the same number. 0 = dead centre.")
+        secBB:Slider("Recoil", wmRecoil, BB_STEP, 0, 4, "",
+            function(v) wmRecoil = tonumber(v) or wmRecoil end,
+            "Camera kick, for EVERY gun. Stock 2 on most, 4 on one. 0 = no kick. Thunderspears ignore this - they kick via a separate camera shake.")
         secBB:Slider("Pellet Spread", bbVal.spread, BB_STEP, 0, BB_STOCK.spread, "",
             function(v) bbVal.spread = tonumber(v) or bbVal.spread end,
-            "Pellet cone radius (x max(0.5, accuracy)). 0 = all 10 pellets dead centre. Stock 8.35")
-        secBB:Button("Apply Blunderbuss", function()
+            "BlunderBuss ONLY - pellet cone radius (x max(0.5, accuracy)). 0 = all 10 pellets dead centre. Stock 8.35")
+        secBB:Button("Apply Weapons", function()
             if not gateOK() then return end
-            task.spawn(function() bbApply(bbVal, "Applied") end)
+            task.spawn(function()
+                local okAll = fireWrite("BASE_INACCURACY_OFFSET", wmInacc)
+                if not fireWrite("BASE_RECOIL_IMPULSE", wmRecoil) then okAll = false end
+                notif("Weapons", okAll and string.format("All guns: inacc %.2f | recoil %.2f", wmInacc, wmRecoil)
+                    or "Inaccuracy/recoil failed - equip a firearm first", 3)
+                bbApply(bbVal, "Applied")   -- BlunderBuss pellet cone, reported via the status label
+            end)
         end)
         secBB:Button("Restore Default", function()
             if not gateOK() then return end
-            bbVal.spread = BB_STOCK.spread   -- keep the slider in step with what we just wrote
-            task.spawn(function() bbApply(BB_STOCK, "Restored") end)
+            -- Put the sliders back too, so the panel shows what is actually in memory.
+            wmInacc, wmRecoil = 7.5, 2
+            bbVal.spread = BB_STOCK.spread
+            task.spawn(function()
+                fireRestore()               -- per-gun originals, NOT one flattened number
+                bbApply(BB_STOCK, "Restored")
+                notif("Weapons", "Restored stock spread, recoil and pellet cone", 3)
+            end)
         end)
     end)
 
