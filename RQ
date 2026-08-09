@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.8"
+GUI.Version = "v2.9"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7360,7 +7360,12 @@ end)()
             local myGen = scGen
             task.spawn(function()
                 local ROT_OFFSET                          = nil   -- discovered at runtime, see below
-                local PRESS_WINDOW, DIFF_GATE             = 9, 30
+                -- The game's own hit test (decompiled from Client.Interfaces.Routes.Screen.Skillcheck)
+                -- is `zone-20 <= spinner <= zone+20`, i.e. a FORTY degree window. Pressing only
+                -- inside +/-9 used the middle 45% of it for no reason and threw away margin on a
+                -- spinner that runs 90-500 deg/s (up to ~1000 as your combo builds). 15 keeps 5
+                -- degrees of safety against a mistimed tap, which is an instant fail.
+                local PRESS_WINDOW, DIFF_GATE             = 15, 30
                 -- 5ms, the value confirmed working live on the standalone build. The port had
                 -- 0.5ms, a tenth of the lead, which under-leads a 900 deg/s spinner by ~4 degrees
                 -- against a 9 degree window.
@@ -7434,8 +7439,9 @@ end)()
                     return true
                 end
 
-                local pg, cache
+                local pg, cache, burst
                 local lastS, lastChangeT, velEst, lastPress = nil, nil, 0, nil
+                local hzN, hzT = 0, clk()
 
                 while scGen == myGen and GUI.Running do
                     if not pg then
@@ -7503,19 +7509,37 @@ end)()
                                 local pred   = ((diff + velEst * LATENCY + 540) % 360) - 180
 
                                 SC.s, SC.t, SC.diff, SC.moving = s, t, diff, moving
+                                local act = moving and rbxActive() or false
                                 if moving then SC.seen = SC.seen + 1 end
                                 -- one reason string, in the order the gate actually evaluates
                                 if not moving then SC.state = "waiting for spinner"
                                 elseif abs(diff) > DIFF_GATE then SC.state = "out of range"
                                 elseif abs(pred) > PRESS_WINDOW then SC.state = "closing in"
-                                elseif not rbxActive() then SC.state = "Roblox not focused"
+                                elseif not act then SC.state = "Roblox not focused"
                                 else SC.state = "TAP" end
 
+                                -- A skillcheck is OVER in a second or two -- the game posts a fail
+                                -- the instant the spinner leaves the zone unpressed -- so the live
+                                -- numbers are back to zero long before anyone can read them.
+                                -- Summarise each burst of motion so ONE attempt explains itself.
+                                if moving then
+                                    if not burst then burst = { t0 = now, n = 0, md = 999, mv = 0, act = 0, taps = 0 } end
+                                    burst.n = burst.n + 1
+                                    if abs(diff) < burst.md then burst.md = abs(diff) end
+                                    if abs(velEst) > burst.mv then burst.mv = abs(velEst) end
+                                    if act then burst.act = burst.act + 1 end
+                                elseif burst then
+                                    SC.last = string.format("%.1fs  %d samples  closest %.0f deg  %.0f deg/s  focused %d/%d  taps %d",
+                                        now - burst.t0, burst.n, burst.md, burst.mv, burst.act, burst.n, burst.taps)
+                                    burst = nil
+                                end
+
                                 if moving and abs(diff) <= DIFF_GATE and abs(pred) <= PRESS_WINDOW
-                                    and rbxActive()
+                                    and act
                                     and ((not lastPress) or (now - lastPress) > COOLDOWN) then
                                     lastPress = now
                                     SC.presses = SC.presses + 1
+                                    if burst then burst.taps = burst.taps + 1 end
                                     pcall(keypress, VK_SPACE)
                                     task.wait(HOLD)
                                     pcall(keyrelease, VK_SPACE)
@@ -7524,6 +7548,10 @@ end)()
                             end
                         end
 
+                        -- loop rate, so a starved loop is visible rather than inferred
+                        hzN = hzN + 1
+                        local hnow = clk()
+                        if hnow - hzT >= 1 then SC.hz = hzN / (hnow - hzT); hzN, hzT = 0, hnow end
                         task.wait()
                     end
                 end
@@ -7542,8 +7570,16 @@ end)()
             secAuto:Label(function()
                 local S = _G.RQSC
                 if type(S) ~= "table" or not S.off then return "" end
-                return string.format("spin %.0f   zone %.0f   diff %.0f   moving %s",
-                    S.s or 0, S.t or 0, S.diff or 0, S.moving and "yes" or "no")
+                return string.format("spin %.0f   zone %.0f   diff %.0f   moving %s   %.0f Hz",
+                    S.s or 0, S.t or 0, S.diff or 0, S.moving and "yes" or "no", S.hz or 0)
+            end)
+        end)
+        -- Survives the check being over, which the live line above cannot.
+        pcall(function()
+            secAuto:Label(function()
+                local S = _G.RQSC
+                if type(S) ~= "table" then return "" end
+                return "last: " .. tostring(S.last or "(no skillcheck seen yet)")
             end)
         end)
     end)
