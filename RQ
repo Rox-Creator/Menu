@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.9"
+GUI.Version = "v3.0"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7634,6 +7634,18 @@ end)()
             -- numeric entries exist in the whole game (both 100, both spears), so the accept
             -- window only has to clear the slider's 1000 ceiling — there are no decoys to exclude.
             INACCURACY_REFERENCE_DISTANCE       = { lo = 0, hi = 5000,   fb = 100 },
+            -- Thunderspear fire shake. All five are spear-exclusive (exactly 2 numeric entries
+            -- each — one per module instance), so they need no partitioning. lo=0 so an already
+            -- zeroed value still passes keep() and the cache revalidator.
+            FIRE_SHAKE_AMPLITUDE                = { lo = 0, hi = 50,     fb = 5/2    },
+            FIRE_SHAKE_ROTATION_INFLUENCE       = { lo = 0, hi = 10,     fb = 4/100  },
+            FIRE_SHAKE_SUSTAIN_TIME             = { lo = 0, hi = 30,     fb = 1/10   },
+            FIRE_SHAKE_FADE_OUT_TIME            = { lo = 0, hi = 30,     fb = 35/100 },
+            -- ⚠ NEVER write 0 here. Shake.Update does `(t + offset) / Frequency % 10000`, so 0
+            -- is a divide by zero -> inf -> inf%10000 = NaN -> math.noise(NaN) = NaN, and NaN*0
+            -- is still NaN, so a zeroed Amplitude does NOT save it. The NaN lands in
+            -- Camera.CFrame. Listed only so the restore path can REPAIR it back to stock.
+            FIRE_SHAKE_FREQUENCY                = { lo = 0, hi = 30,     fb = 12/100 },
             PELLET_SPREAD_OFFSET                = { lo = 0, hi = 40,     fb = 835/100 },
             PELLET_COUNT                        = { lo = 5, hi = 40,     fb = 10  },
             SPREAD_REFERENCE_DISTANCE           = { lo = 10, hi = 200,   fb = 45  },
@@ -8332,6 +8344,44 @@ end)()
         secTS:Slider("Aim Distance", tsDist, 25, 100, 1000, "",
             function(v) tsDist = tonumber(v) or tsDist end,
             "How far ahead the aim point sits. Bigger = tighter cone, because the spread angle is inaccuracy divided by this. Stock 100; 1000 makes the same jitter ten times tighter.")
+        -- Camera shake on throw. Zeroing Amplitude alone already flattens the output vector
+        -- (offset = noise * Amplitude), but we also stop the shake outright: FadeOutTime 0 is
+        -- explicitly handled by Shake.Update as "finish now", and SustainTime 0 removes the hold.
+        -- FIRE_SHAKE_FREQUENCY is deliberately NOT in this list — see the CFG comment; it is a
+        -- divisor, and 0 there NaNs your camera instead of removing the shake.
+        local TS_SHAKE = { "FIRE_SHAKE_AMPLITUDE", "FIRE_SHAKE_ROTATION_INFLUENCE",
+                           "FIRE_SHAKE_SUSTAIN_TIME", "FIRE_SHAKE_FADE_OUT_TIME" }
+        secTS:Button("No Camera Shake", function()
+            if not gateOK() then return end
+            task.spawn(function()
+                local okAll, n = true, 0
+                for _, key in ipairs(TS_SHAKE) do
+                    local list = entriesFor(key)
+                    if #list == 0 then
+                        okAll = false
+                    else
+                        for _, e in ipairs(list) do
+                            local a = gcKey(e)
+                            if a and tsOrig[a] == nil then tsOrig[a] = gcNum(e.value) end
+                        end
+                        if writeEntries(key, list, 0) then n = n + #list else okAll = false end
+                    end
+                end
+                -- Repair a Frequency that has already been zeroed (by an earlier build, or by
+                -- hand in a constant editor). Left at 0 it breaks the camera on the next throw.
+                local fixed = 0
+                for _, e in ipairs(entriesFor("FIRE_SHAKE_FREQUENCY")) do
+                    if (gcNum(e.value) or 0) == 0 then
+                        pcall(function() applygc({ e }, "FIRE_SHAKE_FREQUENCY", 12/100) end)
+                        fixed = fixed + 1
+                    end
+                end
+                notif("Thunderspears",
+                    (okAll and ("Camera shake off (" .. n .. " values)")
+                            or "Shake partly failed - throw a spear once, then retry")
+                    .. (fixed > 0 and ("  |  repaired Frequency x" .. fixed) or ""), 4)
+            end)
+        end):Tooltip("Removes the camera kick when you throw. It is purely visual - the spear's direction comes from your body, so the shake never affected where it goes.")
         secTS:Button("Apply Thunderspears", function()
             if not gateOK() then return end
             task.spawn(function()
@@ -8372,16 +8422,25 @@ end)()
             tsInacc, tsDist = 15, 100
             task.spawn(function()
                 local n = 0
-                for _, key in ipairs({ "BASE_INACCURACY_OFFSET", "INACCURACY_REFERENCE_DISTANCE" }) do
+                for _, key in ipairs({ "BASE_INACCURACY_OFFSET", "INACCURACY_REFERENCE_DISTANCE",
+                                       "FIRE_SHAKE_AMPLITUDE", "FIRE_SHAKE_ROTATION_INFLUENCE",
+                                       "FIRE_SHAKE_SUSTAIN_TIME", "FIRE_SHAKE_FADE_OUT_TIME",
+                                       "FIRE_SHAKE_FREQUENCY" }) do
+                    -- BASE_INACCURACY_OFFSET is SHARED with every gun, so only addresses we
+                    -- actually recorded may be touched. Every other key here is spear-exclusive,
+                    -- so we can fall back to the known stock value — which is what lets this
+                    -- repair constants zeroed outside the menu, Frequency above all.
+                    local shared = (key == "BASE_INACCURACY_OFFSET")
                     for _, e in ipairs(entriesFor(key)) do
                         local o = tsOrig[gcKey(e)]
+                        if o == nil and not shared then o = CFG[key] and CFG[key].fb end
                         if o ~= nil then
                             pcall(function() applygc({ e }, key, o) end)
                             n = n + 1
                         end
                     end
                 end
-                notif("Thunderspears", n > 0 and ("Restored " .. n .. " spear values")
+                notif("Thunderspears", n > 0 and ("Restored " .. n .. " spear values (incl. camera shake)")
                     or "Nothing to restore - no writes recorded", 3)
             end)
         end)
