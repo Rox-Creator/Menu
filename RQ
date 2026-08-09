@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.7"
+GUI.Version = "v2.8"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7346,14 +7346,25 @@ end)()
         -- while a check is on screen, so it never lags the menu.
         local secAuto = tab:Section("Skillcheck", "Left", "Auto-tap the QTE (SPACE)")
         local scGen = 0
+        -- Live state, published so a failure is DIAGNOSABLE. This feature has now broken twice
+        -- (once from a moved memory offset) and both times it failed completely silently: no
+        -- error, no log, just a spinner that never gets tapped. The label below and _G.RQSC make
+        -- the loop's actual view visible, so "it doesn't work" becomes one glance instead of a
+        -- guessing round-trip.
+        local SC = { off = nil, s = 0, t = 0, diff = 0, moving = false, presses = 0, seen = 0, state = "off" }
+        pcall(function() rawset(_G, "RQSC", SC) end)
         secAuto:Toggle("Auto Skillcheck", false, function(on)
             scGen = scGen + 1
-            if not on then return end
+            if not on then SC.state = "off"; return end
+            SC.state = "starting"
             local myGen = scGen
             task.spawn(function()
                 local ROT_OFFSET                          = nil   -- discovered at runtime, see below
                 local PRESS_WINDOW, DIFF_GATE             = 9, 30
-                local LATENCY, MAXVEL, GLITCH_JUMP        = 0.5/1000, 900, 90
+                -- 5ms, the value confirmed working live on the standalone build. The port had
+                -- 0.5ms, a tenth of the lead, which under-leads a 900 deg/s spinner by ~4 degrees
+                -- against a 9 degree window.
+                local LATENCY, MAXVEL, GLITCH_JUMP        = 5/1000, 900, 90
                 local STATIC_TIMEOUT, COOLDOWN, HOLD      = 1/5, 3/20, 3/100
                 local RESOLVE_TTL, IDLE_WAIT              = 1/2, 1/10
                 local VK_SPACE = 0x20
@@ -7435,6 +7446,7 @@ end)()
 
                     if not sc then
                         cache, lastS, lastChangeT, velEst = nil, nil, nil, 0
+                        SC.state = "no Skillcheck GUI"
                         task.wait(IDLE_WAIT)
                     else
                         local now = clk()
@@ -7453,11 +7465,14 @@ end)()
                                     local ea = addrOf(extra)
                                     if ea then probes[#probes + 1] = ea end
                                     ROT_OFFSET = discoverRotOffset(probes)
+                                    SC.off = ROT_OFFSET
                                 end
                             else
                                 cache = nil
+                                SC.state = "Spinner/Validation not found"
                             end
                         end
+                        if cache and not ROT_OFFSET then SC.state = "rotation offset NOT FOUND" end
 
                         if cache then
                             local s = readRot(cache.spin)
@@ -7487,10 +7502,20 @@ end)()
                                 local diff   = angdiff(s, t)
                                 local pred   = ((diff + velEst * LATENCY + 540) % 360) - 180
 
+                                SC.s, SC.t, SC.diff, SC.moving = s, t, diff, moving
+                                if moving then SC.seen = SC.seen + 1 end
+                                -- one reason string, in the order the gate actually evaluates
+                                if not moving then SC.state = "waiting for spinner"
+                                elseif abs(diff) > DIFF_GATE then SC.state = "out of range"
+                                elseif abs(pred) > PRESS_WINDOW then SC.state = "closing in"
+                                elseif not rbxActive() then SC.state = "Roblox not focused"
+                                else SC.state = "TAP" end
+
                                 if moving and abs(diff) <= DIFF_GATE and abs(pred) <= PRESS_WINDOW
                                     and rbxActive()
                                     and ((not lastPress) or (now - lastPress) > COOLDOWN) then
                                     lastPress = now
+                                    SC.presses = SC.presses + 1
                                     pcall(keypress, VK_SPACE)
                                     task.wait(HOLD)
                                     pcall(keyrelease, VK_SPACE)
@@ -7504,6 +7529,23 @@ end)()
                 end
             end)
         end):Tooltip("Legit auto-tap: reads the spinner + zone angle from memory and presses SPACE on time. Roblox must be the focused window. Not an instant-win.")
+        pcall(function()
+            secAuto:Label(function()
+                local S = _G.RQSC
+                if type(S) ~= "table" then return "Skillcheck:  not started" end
+                if S.state == "off" then return "Skillcheck:  off" end
+                return string.format("%s  |  off +%s  taps %d",
+                    tostring(S.state), tostring(S.off or "?"), S.presses or 0)
+            end)
+        end)
+        pcall(function()
+            secAuto:Label(function()
+                local S = _G.RQSC
+                if type(S) ~= "table" or not S.off then return "" end
+                return string.format("spin %.0f   zone %.0f   diff %.0f   moving %s",
+                    S.s or 0, S.t or 0, S.diff or 0, S.moving and "yes" or "no")
+            end)
+        end)
     end)
 
     -- ===== Tab: Character  (ability config pins: Eradicate / Grapple / Velocity) =====
