@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v2.5"
+GUI.Version = "v2.6"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -6087,10 +6087,11 @@ local function drawBadge()
     local Z = 5000000
     rect(x, y, w, h, T.red, Z, 0.22, 6)
     rect(x, y, w, h, T.red, Z + 1, 0.60, 6, false, 1)      -- explicit thickness: pooled Squares keep the last one
-    -- Centred both ways: Center=true puts the glyphs on the pill's midpoint, and (h-fs)/1.35 is
-    -- the same vertical figure button() uses for its labels — Drawing renders text high in its
-    -- box, so a plain (h-fs)/2 sits visibly above centre.
-    txt(ver, x + w / 2, y + (h - fs) / 1.35, fs, T.text, Z + 2, true)   -- T.text so a dark custom accent can't hide it
+    -- Dead centre, measured off a real screenshot rather than guessed: with Center=true Matcha
+    -- treats Position as the text's CENTRE on BOTH axes, not as a top-left corner. So the pill's
+    -- midpoint is the whole answer. (The engine's own button()/tabs() helpers pass a top-left
+    -- style y here and consequently draw their labels a few px high — don't copy them.)
+    txt(ver, x + w / 2, y + h / 2, fs, T.text, Z + 2, true)   -- T.text so a dark custom accent can't hide it
     R.fade = 1
 end
 
@@ -7350,7 +7351,8 @@ end)()
             if not on then return end
             local myGen = scGen
             task.spawn(function()
-                local ROT_OFFSET, PRESS_WINDOW, DIFF_GATE = 376, 9, 30
+                local ROT_OFFSET                          = nil   -- discovered at runtime, see below
+                local PRESS_WINDOW, DIFF_GATE             = 9, 30
                 local LATENCY, MAXVEL, GLITCH_JUMP        = 0.5/1000, 900, 90
                 local STATIC_TIMEOUT, COOLDOWN, HOLD      = 1/5, 3/20, 3/100
                 local RESOLVE_TTL, IDLE_WAIT              = 1/2, 1/10
@@ -7373,8 +7375,43 @@ end)()
                     if ok and a then return tonumber(a) end
                     return nil
                 end
+                -- GuiObject.Rotation is not in Matcha's property bridge, so it has to be read
+                -- straight out of the instance. Its struct offset is NOT stable across Roblox
+                -- updates — it moved 376 -> 296 and silently killed this feature, because a bad
+                -- offset just returns some unrelated float and the spinner never appears to move.
+                --
+                -- So don't hardcode it: find it. Rotation is stored with its sine and cosine
+                -- cached in the next two floats, and that triple is a very strong fingerprint —
+                -- sin^2+cos^2 == 1 AND deg(atan2(sin,cos)) == the degrees field. Requiring it to
+                -- hold on SEVERAL different GuiObjects at once makes a coincidental match
+                -- essentially impossible (measured live: it held on 2527 objects at +296 and on
+                -- 2 at every other offset in a 280..520 sweep).
+                local function rotTripleAt(addr, off)
+                    local okD, d = pcall(mread, "float", addr + off)
+                    local okS, s = pcall(mread, "float", addr + off + 4)
+                    local okC, c = pcall(mread, "float", addr + off + 8)
+                    if not (okD and okS and okC) then return nil end
+                    if type(d) ~= "number" or d ~= d then return nil end
+                    if type(s) ~= "number" or s ~= s then return nil end
+                    if type(c) ~= "number" or c ~= c then return nil end
+                    if abs(s * s + c * c - 1) > 0.002 then return nil end
+                    if abs(((math.deg(math.atan2(s, c)) - d + 540) % 360) - 180) > 0.05 then return nil end
+                    return d
+                end
+                local function discoverRotOffset(addrs)
+                    local best, bestHits = nil, 0
+                    for off = 240, 560, 4 do
+                        local hits = 0
+                        for i = 1, #addrs do
+                            if rotTripleAt(addrs[i], off) then hits = hits + 1 end
+                        end
+                        -- must hold on EVERY probe, and beat whatever came before
+                        if hits == #addrs and hits > bestHits then best, bestHits = off, hits end
+                    end
+                    return best
+                end
                 local function readRot(addr)
-                    if not addr then return nil end
+                    if not (addr and ROT_OFFSET) then return nil end
                     local ok, v = pcall(mread, "float", addr + ROT_OFFSET)
                     if ok and type(v) == "number" and v == v then return v % 360 end
                     return nil
@@ -7402,10 +7439,24 @@ end)()
                     else
                         local now = clk()
                         if (not cache) or (now - cache.t) > RESOLVE_TTL then
-                            local spin = nav(sc, "Skillcheck", "Group", "Frame", "Frame", "Content", "Spinner")
-                            local val  = nav(sc, "Skillcheck", "Group", "Frame", "Frame", "Content", "Validation")
+                            local content = nav(sc, "Skillcheck", "Group", "Frame", "Frame", "Content")
+                            local spin = content and content:FindFirstChild("Spinner")
+                            local val  = content and content:FindFirstChild("Validation")
                             local sa, va = addrOf(spin), addrOf(val)
-                            if sa and va then cache = { spin = sa, val = va, t = now } else cache = nil end
+                            if sa and va then
+                                cache = { spin = sa, val = va, t = now }
+                                -- Locate Rotation once per check, off these two plus a third
+                                -- unrelated GuiObject so the triple has to agree three ways.
+                                if not ROT_OFFSET then
+                                    local probes = { sa, va }
+                                    local extra = content:FindFirstChild("Circle") or sc
+                                    local ea = addrOf(extra)
+                                    if ea then probes[#probes + 1] = ea end
+                                    ROT_OFFSET = discoverRotOffset(probes)
+                                end
+                            else
+                                cache = nil
+                            end
                         end
 
                         if cache then
@@ -7491,6 +7542,11 @@ end)()
             -- are the write-NEVER fingerprint that picks the BlunderBuss's own config table out of
             -- the 7 firearm configs (Trench shotgun is 9 / 60, BlunderBuss is 10 / 45); they are
             -- scanned here only so the ONE Load Values sweep covers them too -- no second freeze.
+            -- Thunderspear aim lever. MUST be listed here or entriesFor() bails at its
+            -- `if not cfg then return {} end` guard and every write silently no-ops. Exactly two
+            -- numeric entries exist in the whole game (both 100, both spears), so the accept
+            -- window only has to clear the slider's 1000 ceiling — there are no decoys to exclude.
+            INACCURACY_REFERENCE_DISTANCE       = { lo = 0, hi = 5000,   fb = 100 },
             PELLET_SPREAD_OFFSET                = { lo = 0, hi = 40,     fb = 835/100 },
             PELLET_COUNT                        = { lo = 5, hi = 40,     fb = 10  },
             SPREAD_REFERENCE_DISTANCE           = { lo = 10, hi = 200,   fb = 45  },
@@ -7506,15 +7562,33 @@ end)()
         local cache        = (reuse and prevG.cache) or {}          -- key -> filtered getgc entries
         local savedDefault = (reuse and prevG.savedDefault) or {}    -- your value BEFORE the first change (Reset Default)
         local warmed = false
+        -- getgc reports .addr as a hex STRING on this build and as a number on others. Normalise
+        -- before any memory_read, or every read fails and the "fast" cache path silently degrades
+        -- into a full re-scan (a multi-second freeze) on every reuse.
+        local function gcAddr(e)
+            if type(e) ~= "table" then return nil end
+            local a = e.addr
+            if type(a) == "number" then return a end
+            if type(a) == "string" then return tonumber(a) or tonumber((a:gsub("^0[xX]", "")), 16) end
+            return nil
+        end
+        local function gcKey(e)
+            local a = gcAddr(e)
+            return a and string.format("%.0f", a) or nil   -- %.0f: tostring() on a big number gives sci-notation
+        end
+        local function gcNum(v) local n = tonumber(v); if n and n == n then return n end return nil end
         -- On reuse, drop any key whose cached address stopped reading a sane number (config rebuilt this
         -- session) so it re-scans lazily; the rest stay instant.
+        local droppedAny = false
         if reuse and type(memory_read) == "function" then
             for k, entries in pairs(cache) do
                 local cfg, e = CFG[k], entries[1]
-                if cfg and e and e.addr then
-                    local ok, r = pcall(memory_read, "double", e.addr)
+                local a = gcAddr(e)
+                if cfg and a then
+                    local ok, r = pcall(memory_read, "double", a)
                     if not (ok and type(r) == "number" and r == r and r >= cfg.lo and r <= cfg.hi) then
                         cache[k] = {}
+                        droppedAny = true
                     end
                 end
             end
@@ -7524,6 +7598,9 @@ end)()
         -- last value written to each, so a script RE-RUN in the same server reuses them instead of
         -- re-fingerprinting a heap we have already edited (the stock-value test can only pass once).
         local bbState = (reuse and type(prevG.bb) == "table" and prevG.bb) or {}
+        -- Resolved slot sets point INTO the cached entries. If any cache was just invalidated the
+        -- entries they reference may be stale too, so throw the resolutions away and re-derive.
+        if droppedAny then bbState.ts, bbState.ok, bbState.slots = nil, nil, nil end
         _G.RequiemCharVals = { job = JOB, cache = cache, savedDefault = savedDefault, warmed = warmed, bb = bbState }
         local function notif(t, m, d) uiNotify(t, m, d or 3) end
         local function keep(cfg, e)   -- is this getgc entry the real numeric config value (not a hash decoy)?
@@ -7639,9 +7716,13 @@ end)()
         end)
 
         -- ---------- Velocity (ODM speed build-up) ----------
-        -- Left column: this tab is split movement (Grapple / Velocity / Dash) on the left,
-        -- combat (Blades / Firearms / Weapons Manual) on the right, so neither side stacks up.
-        local secVe = tab:Section("Velocity", "Left", "ODM speed build-up")
+        -- Column layout is paired by row, and the ORDER OF THESE Section() CALLS is what sets it:
+        --   Grapple      | Velocity
+        --   Dash         | Parry
+        --   Firearm Auto | Firearm Manual
+        --                | Thunderspears
+        -- Move a section by changing its "Left"/"Right" AND its position in this file.
+        local secVe = tab:Section("Velocity", "Right", "ODM speed build-up")
         local veMax, veInc = CFG.GearMaxVelocityMultiplier.fb, CFG.GearVelocityIncreaseRate.fb
         GUI.VeloMult = veMax   -- feed the Tools "Velocity Indicator" popup
         secVe:Slider("Max Velocity", veMax, 0.01, 0.5, 3, "x", function(v) veMax = tonumber(v) or veMax; GUI.VeloMult = veMax end)
@@ -7722,7 +7803,7 @@ end)()
         end)
 
         -- ---------- Blades (non-successful parry window) — slider ----------
-        local secParry = tab:Section("Blades", "Right", "Parry window (default 5s)")
+        local secParry = tab:Section("Parry", "Right", "Parry window (default 5s)")
         local parryVal = CFG.NON_SUCCESSFUL_PARRY_WINDOW_SECONDS.fb
         secParry:Slider("Parry Window", parryVal, 0.1, 0, 5, "s", function(v) parryVal = tonumber(v) or parryVal end)
         secParry:Button("Apply Parry", function()
@@ -7739,53 +7820,139 @@ end)()
         -- 2.5/7.5/8.5, recoil 2/4) so "Zero" writes 0 to all guns; "Restore" writes each gun's OWN
         -- captured original back PER-ENTRY (applygc on a 1-entry list = that one address only), so
         -- the 2.5/8.5/4 guns are never flattened to a single value.
-        -- This INCLUDES the BlunderBuss: it shares both keys with the other guns, which is why its
-        -- own panel below no longer carries inaccuracy / recoil sliders — this one button covers it.
-        local secFire = tab:Section("Firearms", "Right", "Every gun: no spread / no recoil")
-        secFire:Label(function() return "Inaccuracy 0 | Recoil 0   (all guns, incl. BlunderBuss)" end)
+        -- This INCLUDES the BlunderBuss. It EXCLUDES thunderspears — those own their two constants
+        -- outright in their own panel, so the two can never fight over the same addresses.
+        local secFire = tab:Section("Firearm Auto", "Left", "One press: no spread / no recoil")
+        secFire:Label(function() return "Inaccuracy 0 | Recoil 0   (guns only, not spears)" end)
         local FIRE_KEYS = { "BASE_INACCURACY_OFFSET", "BASE_RECOIL_IMPULSE" }
-        local fireOrig  = {}   -- key -> { [tostring(addr)] = original number }, captured before the FIRST write
+        -- key -> { [addr] = original }, captured before the FIRST write. Lives in the per-JobId _G
+        -- table so a script RE-RUN in the same server can still Restore — as a plain local it was
+        -- lost on reload while the writes stayed applied, leaving no way back to stock.
+        local fireOrig = bbState.fireOrig or {}
+        bbState.fireOrig = fireOrig
         -- Shared by the zero button AND the Weapons Manual sliders below, so whichever you use,
         -- Restore still puts the PER-GUN originals back. That matters because the stock values
         -- differ (inaccuracy 2.5 / 7.5 / 8.5 / 15, recoil 2 / 4) and any single written number
         -- flattens them all — without this snapshot the differences would be gone for good.
+        -- Thunderspears share BASE_INACCURACY_OFFSET with all 12 gun entries, so the guns panel
+        -- and the spear panel must be told apart by ADDRESS or whichever you pressed last would
+        -- silently clobber the other.
+        --
+        -- Identify them by ANCHOR, not by value. The obvious test — "the entry whose value is 15"
+        -- — is self-erasing: the moment the spear panel writes 3, it can never be found again.
+        -- INACCURACY_REFERENCE_DISTANCE is spear-exclusive (exactly 2 numeric entries in the whole
+        -- game) and NEITHER panel's identity depends on what we wrote, so it survives our own
+        -- edits. Its slot sits +64 bytes from the spear's inaccuracy slot; the nearest FOREIGN
+        -- inaccuracy slot is ~3.1 MB away, so a 2048-byte moat has ~1500x headroom.
+        -- The module is instantiated twice (two anchors, ~742 MB apart) and BOTH must be written,
+        -- or one config stays stale — so resolve per anchor rather than aborting on "2 matches".
+        local TS_WINDOW = 2048
+        local function tsResolve()
+            if bbState.ts then return bbState.ts end
+            local cands   = entriesFor("BASE_INACCURACY_OFFSET")
+            local anchors = entriesFor("INACCURACY_REFERENCE_DISTANCE")
+            if #anchors == 0 then return nil, "spear config not loaded - equip thunderspears once" end
+            local out, n = {}, 0
+            for _, an in ipairs(anchors) do
+                local aa = gcAddr(an)
+                local hit, hits = nil, 0
+                if aa then
+                    for _, c in ipairs(cands) do
+                        local ca = gcAddr(c)
+                        if ca and math.abs(ca - aa) <= TS_WINDOW then hit = c; hits = hits + 1 end
+                    end
+                end
+                -- exactly one, or we cannot tell spears from a co-located gun: refuse
+                if hits ~= 1 then return nil, "spear layout unexpected (" .. hits .. " near anchor)" end
+                out[gcKey(hit)] = true
+                n = n + 1
+            end
+            if n ~= #anchors then return nil, "resolved " .. n .. "/" .. #anchors end
+            bbState.ts = out          -- cache only a COMPLETE resolve
+            return out
+        end
+        -- applygc on a ONE-entry list writes exactly that address, which is how we hit a subset.
+        -- Verified per entry: range-check the address still reads sanely, write, then read back.
+        -- Without the read-back, pcall returning true proves nothing — applygc can no-op.
+        local function writeEntries(key, list, value)
+            local cfg, done = CFG[key], 0
+            for _, e in ipairs(list) do
+                local a = gcAddr(e)
+                if a and type(memory_read) == "function" then
+                    local okR, cur = pcall(memory_read, "double", a)
+                    cur = okR and gcNum(cur) or nil
+                    if cur and cfg and cur >= cfg.lo and cur <= cfg.hi then
+                        pcall(function() applygc({ e }, key, value) end)
+                        local okB, back = pcall(memory_read, "double", a)
+                        back = okB and gcNum(back) or nil
+                        if back and math.abs(back - value) < 0.0001 then done = done + 1 end
+                    end
+                end
+            end
+            return done == #list, done
+        end
+        -- Every gun EXCEPT thunderspears. FAILS CLOSED: if the partition can't be resolved we
+        -- refuse rather than fall through and write the spear config too.
         local function fireWrite(key, value)
             local safe = entriesFor(key)
-            if #safe == 0 then return false end
-            fireOrig[key] = fireOrig[key] or {}
-            for _, e in ipairs(safe) do
-                local a = tostring(e.addr)
-                if fireOrig[key][a] == nil then fireOrig[key][a] = tonumber(e.value) end
+            if #safe == 0 then return false, "no entries - equip a firearm once" end
+            local ts, why
+            if key == "BASE_INACCURACY_OFFSET" then
+                ts, why = tsResolve()
+                if not ts then return false, why end
             end
-            return apply(key, value)
+            fireOrig[key] = fireOrig[key] or {}
+            local list, skipped = {}, 0
+            for _, e in ipairs(safe) do
+                local a = gcKey(e)
+                if a and ts and ts[a] then
+                    skipped = skipped + 1
+                elseif a then
+                    list[#list + 1] = e
+                    if fireOrig[key][a] == nil then fireOrig[key][a] = gcNum(e.value) end
+                end
+            end
+            if ts and skipped == 0 then return false, "partition failed - refused to touch spears" end
+            if #list == 0 then return false, "nothing to write" end
+            local ok, done = writeEntries(key, list, value)
+            if not ok then return false, string.format("%d/%d writes landed", done, #list) end
+            return true
         end
         local function fireRestore()
+            local n = 0
             for _, key in ipairs(FIRE_KEYS) do
                 local orig = fireOrig[key]
                 if orig then
                     for _, e in ipairs(entriesFor(key)) do
-                        local o = orig[tostring(e.addr)]
+                        local o = orig[gcKey(e)]
                         -- 1-entry applygc = that one address only, so each gun gets ITS own value
-                        if o ~= nil then pcall(function() applygc({ e }, key, o) end) end
+                        if o ~= nil then
+                            pcall(function() applygc({ e }, key, o) end)
+                            n = n + 1
+                        end
                     end
                 end
             end
+            return n
         end
         secFire:Button("Apply Firearms", function()
             if not gateOK() then return end
             task.spawn(function()
-                local okAll = true
+                local okAll, why = true, nil
                 for _, key in ipairs(FIRE_KEYS) do
-                    if not fireWrite(key, 0) then okAll = false end
+                    local ok, reason = fireWrite(key, 0)
+                    if not ok then okAll = false; why = why or reason end
                 end
-                notif("Firearms", okAll and "Every gun: 0 spread / 0 recoil" or "Failed - equip a firearm first", 3)
+                -- surface the resolver's own reason: "equip a firearm first" was previously
+                -- printed for a partition failure too, which is a completely different problem
+                notif("Firearms", okAll and "Guns zeroed (spears untouched)" or ("Failed - " .. tostring(why)), 4)
             end)
         end)
         secFire:Button("Restore Default", function()
             if not gateOK() then return end
             task.spawn(function()
-                fireRestore()
-                notif("Firearms", "Restored each gun's own spread + recoil", 3)
+                local n = fireRestore()
+                notif("Firearms", n > 0 and ("Restored " .. n .. " gun values") or "Nothing to restore - no writes recorded", 3)
             end)
         end)
 
@@ -7889,14 +8056,21 @@ end)()
         end
 
         -- Anchor = a PELLET_COUNT==10 slot with a SPREAD_REFERENCE_DISTANCE==45 slot beside it
-        -- (the TrenchShotgun, the only other pellet gun, is 9 / 60). Ambiguity aborts.
-        local function bbAnchor(snap)
+        -- (the TrenchShotgun, the only other pellet gun, is 9 / 60).
+        --
+        -- THERE ARE ALWAYS TWO. The weapon module is instantiated twice, so two identical
+        -- BlunderBuss config tables exist (measured ~763 MB apart). The old code treated the
+        -- second one as ambiguity and aborted — which means this panel never wrote a single byte
+        -- since it was added. Return every anchor and write them all; leaving one stale makes the
+        -- result depend on which copy the game happens to read.
+        local function bbAnchors(snap)
             local seen, hits = {}, {}
             for _, pc in ipairs(snap.PELLET_COUNT) do
                 if bbNear(bbNum(pc.value), 10) then
                     local pa = bbAddr(pc)
                     for _, sr in ipairs(snap.SPREAD_REFERENCE_DISTANCE) do
-                        if bbNear(bbNum(sr.value), 45) and math.abs(pa - bbAddr(sr)) <= BB_WINDOW then
+                        local sa = bbAddr(sr)
+                        if bbNear(bbNum(sr.value), 45) and pa and sa and math.abs(pa - sa) <= BB_WINDOW then
                             local k = string.format("%.0f", pa)   -- %.0f, not tostring: big addresses
                             if not seen[k] then                   -- would render in scientific notation
                                 seen[k] = true
@@ -7907,29 +8081,33 @@ end)()
                 end
             end
             if #hits == 0 then return nil, "BlunderBuss not in memory - equip one, then retry" end
-            if #hits > 1 then return nil, "ambiguous (" .. #hits .. " matching tables) - wrote nothing" end
-            return hits[1]
+            return hits
         end
 
-        -- The slot must be the ONLY entry of its key inside the window (a moat: a second one means
-        -- another gun's table is co-located and we cannot tell them apart) AND still hold its stock
-        -- value. Anything else aborts without writing.
+        -- Per anchor, the slot must be the ONLY entry of its key inside the window — a moat: a
+        -- second one means another gun's table is co-located and we cannot tell them apart.
+        -- NOTE there is deliberately no "still at stock" test any more. Identity comes from the
+        -- anchor pair, which this panel never writes; testing a value we DO write is self-erasing
+        -- and was what made the old resolver a one-shot.
         local function bbResolveFresh()
             local snap = bbSnapshot()
-            local anchor, why = bbAnchor(snap)
-            if not anchor then return nil, why end
+            local anchors, why = bbAnchors(snap)
+            if not anchors then return nil, why end
             local out = {}
             for _, slot in ipairs(BB_ORDER) do
-                local key, cands = BB_KEY[slot], {}
-                for _, e in ipairs(snap[key]) do
-                    if math.abs(bbAddr(e) - anchor) <= BB_WINDOW then cands[#cands + 1] = e end
+                local key, list = BB_KEY[slot], {}
+                for _, anchor in ipairs(anchors) do
+                    local cands = {}
+                    for _, e in ipairs(snap[key]) do
+                        local ea = bbAddr(e)
+                        if ea and math.abs(ea - anchor) <= BB_WINDOW then cands[#cands + 1] = e end
+                    end
+                    if #cands ~= 1 then
+                        return nil, key .. ": " .. #cands .. " candidates near an anchor - wrote nothing"
+                    end
+                    list[#list + 1] = cands[1]
                 end
-                if #cands == 0 then return nil, key .. " missing near anchor - wrote nothing" end
-                if #cands > 1 then return nil, "another gun's " .. key .. " is co-located - wrote nothing" end
-                if not bbNear(bbNum(cands[1].value), BB_STOCK[slot]) then
-                    return nil, key .. " not at stock (" .. tostring(cands[1].value) .. ") - wrote nothing"
-                end
-                out[slot] = cands[1]
+                out[slot] = list
             end
             return out
         end
@@ -7978,12 +8156,19 @@ end)()
             end
             local okAll, parts = true, {}
             for _, slot in ipairs(BB_ORDER) do
-                local ok, err = bbWriteSlot(slot, slots[slot], vals[slot])
-                if ok then
+                local list = slots[slot] or {}
+                local wrote, failed = 0, nil
+                -- write EVERY instance of the config, not just the first
+                for _, e in ipairs(list) do
+                    local ok, err = bbWriteSlot(slot, e, vals[slot])
+                    if ok then wrote = wrote + 1 else failed = failed or err end
+                end
+                if wrote == #list and wrote > 0 then
                     parts[#parts + 1] = string.format("%s %.2f", BB_LABEL[slot], vals[slot])
                 else
                     okAll = false
-                    parts[#parts + 1] = BB_LABEL[slot] .. " " .. tostring(err)
+                    parts[#parts + 1] = string.format("%s %s (%d/%d)", BB_LABEL[slot],
+                        tostring(failed or "no slots"), wrote, #list)
                 end
             end
             -- only make the resolution sticky once the write has been verified
@@ -7992,23 +8177,26 @@ end)()
             if not quiet then notif("Blunderbuss", bbStatus, okAll and 3 or 5) end
         end
 
-        -- ---------- Weapons Manual: tune by hand instead of going all-zero ----------
-        -- Two scopes live in this one section, and the difference is not cosmetic:
-        --   Inaccuracy / Recoil  -> written BY KEY NAME, so they hit EVERY firearm at once
-        --                           (musket, flintlock, blunderbuss, and thunderspears, which
-        --                           shares BASE_INACCURACY_OFFSET at 15). One number replaces all
-        --                           of their different stock values; Restore undoes that per-gun.
-        --   Pellet Spread        -> BlunderBuss ONLY, via the address fingerprint above, because
-        --                           PELLET_SPREAD_OFFSET is shared with the other pellet gun.
+        -- ---------- Firearm Manual: tune by hand instead of going all-zero ----------
+        -- Three scopes live in this one section, and the differences are not cosmetic:
+        --   Inaccuracy    -> every gun EXCEPT thunderspears (their addresses are excluded by
+        --                    tsResolve(), so this panel and the spear panel never fight)
+        --   Recoil        -> every gun; thunderspears have no recoil constant at all
+        --   Pellet Spread -> BlunderBuss ONLY, via the address fingerprint above, because
+        --                    PELLET_SPREAD_OFFSET is shared with the other pellet gun
+        -- Guns have different stock values, so one slider flattens them to a single number;
+        -- Restore puts each gun's own value back from the pre-write snapshot.
         local wmInacc, wmRecoil = 7.5, 2   -- musket/flintlock stock, the most common of each
-        local secBB = tab:Section("Weapons Manual", "Right", "Hand-tune instead of zeroing")
+        local secBB = tab:Section("Firearm Manual", "Right", "Hand-tune instead of zeroing")
         secBB:Label(function() return bbStatus end)
-        secBB:Slider("Inaccuracy", wmInacc, 0.1, 0, 15, "",
+        -- Ranges are capped at the WORST stock value in the game (inaccuracy 8.5, recoil 4) — there
+        -- is no reason to offer a setting that shoots straighter guns crooked.
+        secBB:Slider("Inaccuracy", wmInacc, 0.1, 0, 8.5, "",
             function(v) wmInacc = tonumber(v) or wmInacc end,
-            "Aim-point scatter, for EVERY gun. Stock differs per weapon (2.5 / 7.5 / 8.5, thunderspears 15) and one slider sets them all to the same number. 0 = dead centre.")
+            "Aim-point scatter, for every gun EXCEPT thunderspears. Stock is 2.5 / 7.5 / 8.5 depending on the weapon and one slider sets them all to the same number. 0 = dead centre.")
         secBB:Slider("Recoil", wmRecoil, BB_STEP, 0, 4, "",
             function(v) wmRecoil = tonumber(v) or wmRecoil end,
-            "Camera kick, for EVERY gun. Stock 2 on most, 4 on one. 0 = no kick. Thunderspears ignore this - they kick via a separate camera shake.")
+            "Camera kick, for every gun. Stock 2 on most, 4 on one. 0 = no kick. Thunderspears have no recoil constant at all - they kick via a separate camera shake.")
         secBB:Slider("Pellet Spread", bbVal.spread, BB_STEP, 0, BB_STOCK.spread, "",
             function(v) bbVal.spread = tonumber(v) or bbVal.spread end,
             "BlunderBuss ONLY - pellet cone radius (x max(0.5, accuracy)). 0 = all 10 pellets dead centre. Stock 8.35")
@@ -8031,6 +8219,83 @@ end)()
                 fireRestore()               -- per-gun originals, NOT one flattened number
                 bbApply(BB_STOCK, "Restored")
                 notif("Weapons", "Restored stock spread, recoil and pellet cone", 3)
+            end)
+        end)
+
+        -- ---------- Thunderspears ----------
+        -- The spear's whole accuracy model is two numbers. It picks an aim point
+        -- REFERENCE_DISTANCE studs straight ahead, jitters that point by up to +/-INACCURACY on
+        -- each axis, and fires at it — so the cone half-angle is atan(inaccuracy / distance).
+        -- That gives two ways to tighten it, and they are NOT equivalent:
+        --   Spear Inaccuracy  -> shrinks the jitter. Shared key, but we write ONLY the spear
+        --                        addresses (see tsResolve), so guns are untouched.
+        --   Aim Distance      -> lengthens the lever arm, which divides the cone down without
+        --                        touching the jitter. INACCURACY_REFERENCE_DISTANCE has exactly
+        --                        two numeric entries in the whole game and both are spears, so
+        --                        this one is inherently safe. 1000 = a tenth of the stock cone.
+        local tsInacc, tsDist = 15, 100
+        -- addr -> pre-write value. In the per-JobId _G table for the same reason as fireOrig:
+        -- as a plain local, a script re-run kept the writes but lost the way back.
+        local tsOrig = bbState.tsOrig or {}
+        bbState.tsOrig = tsOrig
+        local secTS = tab:Section("Thunderspears", "Right", "Spear accuracy")
+        secTS:Slider("Spear Inaccuracy", tsInacc, 0.1, 0, 15, "",
+            function(v) tsInacc = tonumber(v) or tsInacc end,
+            "Random scatter applied to the aim point, in studs. Stock 15 - by far the loosest weapon in the game. 0 = perfectly straight.")
+        secTS:Slider("Aim Distance", tsDist, 25, 100, 1000, "",
+            function(v) tsDist = tonumber(v) or tsDist end,
+            "How far ahead the aim point sits. Bigger = tighter cone, because the spread angle is inaccuracy divided by this. Stock 100; 1000 makes the same jitter ten times tighter.")
+        secTS:Button("Apply Thunderspears", function()
+            if not gateOK() then return end
+            task.spawn(function()
+                local ts, why = tsResolve()
+                if not ts then
+                    notif("Thunderspears", "Failed - " .. tostring(why), 5)
+                    return
+                end
+                -- spear-only subset of the shared inaccuracy key
+                local list = {}
+                for _, e in ipairs(entriesFor("BASE_INACCURACY_OFFSET")) do
+                    local a = gcKey(e)
+                    if a and ts[a] then
+                        list[#list + 1] = e
+                        if tsOrig[a] == nil then tsOrig[a] = gcNum(e.value) end
+                    end
+                end
+                local okI, doneI = false, 0
+                if #list > 0 then okI, doneI = writeEntries("BASE_INACCURACY_OFFSET", list, tsInacc) end
+                -- the aim distance key is spear-exclusive, so every entry is ours
+                local dist = entriesFor("INACCURACY_REFERENCE_DISTANCE")
+                for _, e in ipairs(dist) do
+                    local a = gcKey(e)
+                    if a and tsOrig[a] == nil then tsOrig[a] = gcNum(e.value) end
+                end
+                local okD, doneD = writeEntries("INACCURACY_REFERENCE_DISTANCE", dist, tsDist)
+                if okI and okD then
+                    notif("Thunderspears", string.format("Spread %.1f | aim distance %d   cone ~%.1f deg (stock 8.5)",
+                        tsInacc, tsDist, math.deg(math.atan(tsInacc / tsDist))), 4)
+                else
+                    notif("Thunderspears", string.format("Partial - spread %d/%d, distance %d/%d",
+                        doneI, #list, doneD, #dist), 5)
+                end
+            end)
+        end)
+        secTS:Button("Restore Default", function()
+            if not gateOK() then return end
+            tsInacc, tsDist = 15, 100
+            task.spawn(function()
+                local n = 0
+                for _, key in ipairs({ "BASE_INACCURACY_OFFSET", "INACCURACY_REFERENCE_DISTANCE" }) do
+                    for _, e in ipairs(entriesFor(key)) do
+                        local o = tsOrig[gcKey(e)]
+                        if o ~= nil then
+                            pcall(function() applygc({ e }, key, o) end)
+                            n = n + 1
+                        end
+                    end
+                end
+                notif("Thunderspears", n > 0 and ("Restored " .. n .. " spear values")
+                    or "Nothing to restore - no writes recorded", 3)
             end)
         end)
     end)
