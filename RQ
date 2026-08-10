@@ -25,7 +25,7 @@ local GUI = {}
 -- content header, so there is exactly one place to edit. Format vMAJOR.MINOR; minor for normal
 -- changes, major for a rework.
 -- ============================================================
-GUI.Version = "v3.0"
+GUI.Version = "v3.1"
 GUI.Elements = {}
 GUI.ContentElements = {}
 GUI.SubTabElements = {}
@@ -7676,6 +7676,32 @@ end)()
             return a and string.format("%.0f", a) or nil   -- %.0f: tostring() on a big number gives sci-notation
         end
         local function gcNum(v) local n = tonumber(v); if n and n == n then return n end return nil end
+        -- RETIRED KEYS. The _G cache is keyed by JobId and survives a script re-run, so a key that an
+        -- OLDER build scanned stays in it forever even after its slider is deleted. Two consequences,
+        -- both real:
+        --   1. `warmed` below is set by ANY cached key with entries. A retired key alone would flip it
+        --      true, unlocking the Character tab while none of the CURRENT keys have been swept — and
+        --      then every entriesFor() falls back to a slow per-key getgc instead of one batch sweep.
+        --   2. Anything the old build APPLIED is still live in the game with no control left to undo
+        --      it (it only clears on rejoin).
+        -- So on reuse: write each retired key back to the value captured before its first change, then
+        -- drop it. Setting an existing field to nil mid-pairs() is defined behaviour in Lua.
+        local retiredFixed = 0
+        if reuse then
+            for k, entries in pairs(cache) do
+                if not CFG[k] then
+                    local orig = savedDefault[k]
+                    if orig ~= nil and type(applygc) == "function" then
+                        for _, e in ipairs(entries) do
+                            pcall(function() applygc({ e }, k, orig) end)
+                            retiredFixed = retiredFixed + 1
+                        end
+                    end
+                    cache[k] = nil
+                    savedDefault[k] = nil
+                end
+            end
+        end
         -- On reuse, drop any key whose cached address stopped reading a sane number (config rebuilt this
         -- session) so it re-scans lazily; the rest stay instant.
         local droppedAny = false
@@ -7692,7 +7718,8 @@ end)()
                 end
             end
         end
-        for _, entries in pairs(cache) do if #entries > 0 then warmed = true; break end end
+        -- CFG[k] guard is load-bearing: without it a retired key's leftovers report the tab as loaded.
+        for k, entries in pairs(cache) do if CFG[k] and #entries > 0 then warmed = true; break end end
         -- `bb` rides along on the same JobId key: it holds the BlunderBuss's resolved GC slots + the
         -- last value written to each, so a script RE-RUN in the same server reuses them instead of
         -- re-fingerprinting a heap we have already edited (the stock-value test can only pass once).
@@ -7702,6 +7729,9 @@ end)()
         if droppedAny then bbState.ts, bbState.ok, bbState.slots = nil, nil, nil end
         _G.RequiemCharVals = { job = JOB, cache = cache, savedDefault = savedDefault, warmed = warmed, bb = bbState }
         local function notif(t, m, d) uiNotify(t, m, d or 3) end
+        if retiredFixed > 0 then
+            notif("Character", "Reverted " .. retiredFixed .. " value(s) from removed sliders", 4)
+        end
         local function keep(cfg, e)   -- is this getgc entry the real numeric config value (not a hash decoy)?
             if type(e) ~= "table" or e.type ~= "number" then return false end
             local v = tonumber(e.value); return v ~= nil and v >= cfg.lo and v <= cfg.hi
@@ -7824,7 +7854,7 @@ end)()
         local secVe = tab:Section("Velocity", "Right", "ODM speed build-up")
         local veMax, veInc = CFG.GearMaxVelocityMultiplier.fb, CFG.GearVelocityIncreaseRate.fb
         GUI.VeloMult = veMax   -- feed the Tools "Velocity Indicator" popup
-        secVe:Slider("Max Velocity", veMax, 0.01, 0.5, 3, "x", function(v) veMax = tonumber(v) or veMax; GUI.VeloMult = veMax end)
+        secVe:Slider("Max Velocity", veMax, 0.01, 0.5, 5, "x", function(v) veMax = tonumber(v) or veMax; GUI.VeloMult = veMax end)
         secVe:Slider("Increase Rate", veInc, 0.05, 0.5, 5, "x", function(v) veInc = tonumber(v) or veInc end)
         secVe:Button("Apply Velocity", function()
             applyMany("Velocity", { "GearMaxVelocityMultiplier", "GearVelocityIncreaseRate" }, { veMax, veInc })
